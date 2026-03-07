@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.env
+data/
+logs/
+*.db
+*.db-journal
+.claude/
+REQUIREMENTS.md

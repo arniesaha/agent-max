@@ -1,0 +1,36 @@
+{
+  "name": "agent-max",
+  "version": "1.0.0",
+  "description": "Max - autonomous agent for Mac Mini",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "nodemon --exec tsx src/index.ts",
+    "tui": "tsx src/tui.ts"
+  },
+  "bin": {
+    "max-tui": "dist/tui.js"
+  },
+  "dependencies": {
+    "@a2a-js/sdk": "latest",
+    "@mariozechner/pi-agent-core": "latest",
+    "@mariozechner/pi-ai": "latest",
+    "@mariozechner/pi-tui": "^0.56.3",
+    "@types/ws": "^8.18.1",
+    "better-sqlite3": "latest",
+    "dotenv": "latest",
+    "express": "latest",
+    "grammy": "latest",
+    "ws": "^8.19.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "latest",
+    "@types/express": "latest",
+    "@types/node": "latest",
+    "nodemon": "latest",
+    "tsx": "latest",
+    "typescript": "^5.0.0"
+  }
+}
