@@ -7,3 +7,4 @@ logs/
 *.db-journal
 .claude/
 REQUIREMENTS.md
+TODO.md
