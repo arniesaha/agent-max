@@ -54,19 +54,105 @@ async function cdpCommand(wsUrl: string, method: string, params: Record<string, 
   });
 }
 
+/**
+ * Navigate to a URL and wait for the page to finish loading via CDP events.
+ * Falls back to a fixed delay if the load event doesn't fire within timeout.
+ */
+async function navigateAndWait(wsUrl: string, url: string, timeout = 30000): Promise<void> {
+  const { WebSocket } = await import("ws");
+
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(wsUrl);
+    const navId = Math.floor(Math.random() * 100000);
+    const enableId = navId + 1;
+    let settled = false;
+
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        ws.close();
+        resolve(); // resolve anyway — page may be partially loaded
+      }
+    }, timeout);
+
+    ws.on("open", () => {
+      // Enable Page events so we get loadEventFired
+      ws.send(JSON.stringify({ id: enableId, method: "Page.enable" }));
+      ws.send(JSON.stringify({ id: navId, method: "Page.navigate", params: { url } }));
+    });
+
+    ws.on("message", (data: Buffer) => {
+      const msg = JSON.parse(data.toString());
+
+      // Navigation error (e.g. net::ERR_NAME_NOT_RESOLVED)
+      if (msg.id === navId && msg.result?.errorText) {
+        clearTimeout(timer);
+        settled = true;
+        ws.close();
+        reject(new Error(`Navigation failed: ${msg.result.errorText}`));
+        return;
+      }
+
+      // Page finished loading
+      if (msg.method === "Page.loadEventFired" && !settled) {
+        // Give JS a moment to hydrate after load
+        setTimeout(() => {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timer);
+            ws.close();
+            resolve();
+          }
+        }, 1500);
+      }
+    });
+
+    ws.on("error", (err: Error) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        reject(err);
+      }
+    });
+  });
+}
+
+const SCRAPE_JS = `
+(() => {
+  // Remove script, style, nav, footer, hidden elements
+  const remove = document.querySelectorAll('script, style, noscript, nav, footer, header, [aria-hidden="true"], [style*="display:none"], [style*="display: none"]');
+  remove.forEach(el => el.remove());
+
+  const title = document.title || '';
+  const meta = document.querySelector('meta[name="description"]')?.getAttribute('content') || '';
+
+  // Get visible text content, collapse whitespace
+  const body = document.body?.innerText || '';
+  const lines = body.split('\\n').map(l => l.trim()).filter(l => l.length > 0);
+  const text = lines.join('\\n');
+
+  // Truncate to ~12k chars to stay within tool result limits
+  const maxLen = 12000;
+  const truncated = text.length > maxLen ? text.slice(0, maxLen) + '\\n...(truncated)' : text;
+
+  return 'Title: ' + title + '\\n' + (meta ? 'Description: ' + meta + '\\n' : '') + '\\n' + truncated;
+})()
+`;
+
 export const browserControl: AgentTool = {
   name: "browser_control",
   label: "Browser Control",
-  description: "Control Chrome via CDP. Actions: list_tabs, navigate, evaluate (run JS), screenshot. Port 9222 for debug profile, port 18800 for LinkedIn/automation profile.",
+  description: "Control Chrome via CDP. Actions: list_tabs, navigate, scrape (navigate to URL and extract page text — best for summarizing web pages), evaluate (run JS), screenshot. Port 9222 for debug profile, port 18800 for automation.",
   parameters: Type.Object({
     action: Type.Union([
       Type.Literal("list_tabs"),
       Type.Literal("navigate"),
+      Type.Literal("scrape"),
       Type.Literal("evaluate"),
       Type.Literal("screenshot"),
     ], { description: "Action to perform" }),
     port: Type.Optional(Type.Number({ description: "CDP port. 9222 for debug, 18800 for automation. Default: 9222" })),
-    url: Type.Optional(Type.String({ description: "URL to navigate to (for navigate action)" })),
+    url: Type.Optional(Type.String({ description: "URL to navigate to (for navigate/scrape action)" })),
     expression: Type.Optional(Type.String({ description: "JavaScript expression to evaluate (for evaluate action)" })),
     tab_index: Type.Optional(Type.Number({ description: "Tab index to target (default: 0)" })),
   }),
@@ -92,10 +178,32 @@ export const browserControl: AgentTool = {
           const tab = pages[tab_index || 0];
           if (!tab) return { content: [{ type: "text", text: "No browser tab available" }], details: { error: "no tabs" } };
 
-          await cdpCommand(tab.webSocketDebuggerUrl, "Page.navigate", { url });
-          // Wait for page to load
-          await new Promise(r => setTimeout(r, 3000));
+          await navigateAndWait(tab.webSocketDebuggerUrl, url);
           return { content: [{ type: "text", text: `Navigated to ${url}` }], details: { url } };
+        }
+
+        case "scrape": {
+          if (!url) return { content: [{ type: "text", text: "No URL provided" }], details: { error: "missing url" } };
+          const tabs = await getTabs(port);
+          const pages = tabs.filter(t => t.type === "page");
+          const tab = pages[tab_index || 0];
+          if (!tab) return { content: [{ type: "text", text: "No browser tab available. Is Chrome running with --remote-debugging-port?" }], details: { error: "no tabs" } };
+
+          // Navigate and wait for load
+          await navigateAndWait(tab.webSocketDebuggerUrl, url);
+
+          // Extract text content
+          const result = await cdpCommand(tab.webSocketDebuggerUrl, "Runtime.evaluate", {
+            expression: SCRAPE_JS,
+            returnByValue: true,
+          }, 15000);
+
+          const text = result?.result?.value;
+          if (!text) {
+            return { content: [{ type: "text", text: `Navigated to ${url} but could not extract text content. The page may require JavaScript rendering or authentication.` }], details: { url, error: "empty" } };
+          }
+
+          return { content: [{ type: "text", text }], details: { url, length: text.length } };
         }
 
         case "evaluate": {

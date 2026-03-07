@@ -11,6 +11,17 @@ const STREAM_EDIT_INTERVAL_MS = 1200;
 const TYPING_INTERVAL_MS = 4000;
 const STATUS_MIN_INTERVAL_MS = 800; // min gap between status edits to avoid Telegram 429
 const MAX_MSG_LEN = 4000;
+const PROMPT_TIMEOUT_MS = 180_000; // 3 minutes max per prompt
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms / 1000}s`)), ms);
+    promise.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); },
+    );
+  });
+}
 
 interface ConversationEntry {
   role: "user" | "assistant";
@@ -392,7 +403,7 @@ export function createTelegramBot(agent: Agent): Bot {
       });
 
       startEditing();
-      await agent.prompt(text);
+      await withTimeout(agent.prompt(text), PROMPT_TIMEOUT_MS, "Agent prompt");
       unsub();
 
       if (editTimer) clearInterval(editTimer);
