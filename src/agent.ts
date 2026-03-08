@@ -2,6 +2,7 @@ import { Agent } from "@mariozechner/pi-agent-core";
 import { getModel, getEnvApiKey, type Message } from "@mariozechner/pi-ai";
 import type { AgentMessage, AgentTool } from "@mariozechner/pi-agent-core";
 import { loadMemory } from "./memory.js";
+import { log } from "./logger.js";
 import { wakeGpu, shutdownGpu, gpuStatus } from "./tools/gpu.js";
 import { readFileTool, writeFileTool, listFilesTool } from "./tools/fs.js";
 import { sshToNas } from "./tools/ssh.js";
@@ -34,7 +35,11 @@ const staticTools: AgentTool[] = [
 ];
 
 export async function createAgent(): Promise<Agent> {
-  const model = getModel("google", "gemini-2.5-pro");
+  const defaultModel = process.env.DEFAULT_MODEL || "gemini-2.5-pro";
+  const provider = defaultModel.startsWith("claude") ? "anthropic" : "google";
+  const model = getModel(provider as any, defaultModel as any);
+  if (!model) throw new Error(`Model not found: ${provider}/${defaultModel}`);
+  log("info", `Agent created with ${model.id}`);
   const systemPrompt = await loadMemory();
 
   const agent = new Agent({

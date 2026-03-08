@@ -30,7 +30,6 @@ async function main() {
 
   // Create agent
   const agent = await createAgent();
-  log("info", "Agent created with Gemini 2.5 Pro");
 
   // Start A2A server
   startA2AServer(agent);
