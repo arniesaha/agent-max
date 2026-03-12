@@ -1,5 +1,5 @@
 import { Agent } from "@mariozechner/pi-agent-core";
-import { getModel, getEnvApiKey, type Message } from "@mariozechner/pi-ai";
+import { getModel, getEnvApiKey, streamSimple, type Message } from "@mariozechner/pi-ai";
 import type { AgentMessage, AgentTool } from "@mariozechner/pi-agent-core";
 import { loadMemory } from "./memory.js";
 import { log } from "./logger.js";
@@ -14,6 +14,7 @@ import { launchpadRunScraper, launchpadDeploy } from "./tools/launchpad.js";
 import { runShell } from "./tools/shell.js";
 import { createContextInfoTool } from "./tools/context-info.js";
 import { transformContext } from "./context.js";
+import { traceTools } from "./tracing.js";
 
 const staticTools: AgentTool[] = [
   // GPU
@@ -39,8 +40,31 @@ export async function createAgent(): Promise<Agent> {
   const provider = defaultModel.startsWith("claude") ? "anthropic" : "google";
   const model = getModel(provider as any, defaultModel as any);
   if (!model) throw new Error(`Model not found: ${provider}/${defaultModel}`);
+
+  // Route API calls through AgentWeave observability proxy if configured
+  if (provider === "anthropic" && process.env.ANTHROPIC_BASE_URL) {
+    (model as any).baseUrl = process.env.ANTHROPIC_BASE_URL;
+    log("info", `Anthropic base URL overridden to ${process.env.ANTHROPIC_BASE_URL}`);
+  }
+  if (provider === "google" && process.env.GOOGLE_GENAI_BASE_URL) {
+    (model as any).baseUrl = `${process.env.GOOGLE_GENAI_BASE_URL}/v1beta`;
+    log("info", `Google GenAI base URL overridden to ${(model as any).baseUrl}`);
+  }
+
   log("info", `Agent created with ${model.id}`);
   const systemPrompt = await loadMemory();
+
+  // Wrap streamSimple to inject AgentWeave proxy auth + tracing header
+  const proxyToken = process.env.AGENTWEAVE_PROXY_TOKEN;
+  const agentWeaveStreamFn: typeof streamSimple = (m, ctx, opts) =>
+    streamSimple(m, ctx, {
+      ...opts,
+      headers: {
+        ...opts?.headers,
+        "X-AgentWeave-Agent-Id": "max-v1",
+        ...(proxyToken ? { Authorization: `Bearer ${proxyToken}` } : {}),
+      },
+    });
 
   const agent = new Agent({
     initialState: {
@@ -52,10 +76,11 @@ export async function createAgent(): Promise<Agent> {
     },
     getApiKey: (provider) => getEnvApiKey(provider),
     transformContext,
+    streamFn: agentWeaveStreamFn,
   });
 
-  // Add agent-bound tools
-  const allTools = [...staticTools, createContextInfoTool(agent)];
+  // Add agent-bound tools, wrapped with tracing spans
+  const allTools = traceTools([...staticTools, createContextInfoTool(agent)]);
   agent.state.tools = allTools;
 
   return agent;

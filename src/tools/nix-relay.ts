@@ -1,5 +1,6 @@
 import { Type } from "@mariozechner/pi-ai";
 import type { AgentTool } from "@mariozechner/pi-agent-core";
+import { context, propagation } from "@opentelemetry/api";
 
 const NIX_A2A_URL = process.env.NIX_A2A_URL || "http://localhost:8771";
 const A2A_SHARED_SECRET = process.env.A2A_SHARED_SECRET || "";
@@ -27,6 +28,7 @@ export const delegateToNix: AgentTool = {
         headers: {
           "Content-Type": "application/json",
           ...authHeaders,
+          ...(() => { const h: Record<string, string> = {}; propagation.inject(context.active(), h); return h; })(),
         },
         body: JSON.stringify({
           id: taskId,

@@ -234,16 +234,14 @@ export function createTelegramBot(agent: Agent): Bot {
     await ctx.reply("Conversation context cleared.");
   });
 
-  bot.on("message:text", async (ctx) => {
-    if (!isAllowed(ctx)) return;
-
-    const text = ctx.message.text;
-    log("info", `Telegram message from ${ctx.from?.id}: ${text.slice(0, 100)}`);
+  // Core message handler — processes text with optional images
+  async function handleMessage(ctx: Context, text: string, images?: { type: "image"; data: string; mimeType: string }[]) {
+    log("info", `Telegram message from ${ctx.from?.id}: ${text.slice(0, 100)}${images?.length ? ` (+${images.length} image${images.length > 1 ? "s" : ""})` : ""}`);
 
     conversationHistory.push({ role: "user", text, timestamp: Date.now() });
     trimHistory();
 
-    const task = createTask("telegram_msg", "telegram", { text, from: ctx.from?.id });
+    const task = createTask("telegram_msg", "telegram", { text, from: ctx.from?.id, hasImages: !!images?.length });
     updateTaskStatus(task.id, "working");
 
     // Send placeholder message (plain text, no parse_mode)
@@ -403,7 +401,7 @@ export function createTelegramBot(agent: Agent): Bot {
       });
 
       startEditing();
-      await withTimeout(agent.prompt(text), PROMPT_TIMEOUT_MS, "Agent prompt");
+      await withTimeout(agent.prompt(text, images), PROMPT_TIMEOUT_MS, "Agent prompt");
       unsub();
 
       if (editTimer) clearInterval(editTimer);
@@ -461,6 +459,42 @@ export function createTelegramBot(agent: Agent): Bot {
       } catch {
         await ctx.reply(`❌ Error: ${e.message}`);
       }
+    }
+  }
+
+  // Text messages
+  bot.on("message:text", async (ctx) => {
+    if (!isAllowed(ctx)) return;
+    await handleMessage(ctx, ctx.message.text);
+  });
+
+  // Photo messages (with optional caption)
+  bot.on("message:photo", async (ctx) => {
+    if (!isAllowed(ctx)) return;
+
+    const caption = ctx.message.caption || "What do you see in this image?";
+
+    try {
+      // Get the largest photo (last in the array)
+      const photo = ctx.message.photo[ctx.message.photo.length - 1];
+      const file = await ctx.api.getFile(photo.file_id);
+      const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+
+      const res = await fetch(fileUrl, { signal: AbortSignal.timeout(15000) });
+      if (!res.ok) {
+        await ctx.reply("Failed to download image from Telegram.");
+        return;
+      }
+
+      const buf = Buffer.from(await res.arrayBuffer());
+      const base64 = buf.toString("base64");
+      const ext = file.file_path?.split(".").pop()?.toLowerCase() || "jpg";
+      const mimeType = ext === "png" ? "image/png" : ext === "gif" ? "image/gif" : ext === "webp" ? "image/webp" : "image/jpeg";
+
+      await handleMessage(ctx, caption, [{ type: "image", data: base64, mimeType }]);
+    } catch (e: any) {
+      log("error", `Failed to process photo: ${e.message}`);
+      await ctx.reply(`Failed to process image: ${e.message}`);
     }
   });
 

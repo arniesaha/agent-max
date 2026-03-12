@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { initTracing } from "./tracing.js";
 import { createAgent } from "./agent.js";
 import { createTelegramBot } from "./telegram-bot.js";
 import { startA2AServer } from "./a2a-server.js";
@@ -8,6 +9,9 @@ import { log } from "./logger.js";
 
 async function main() {
   log("info", "Max agent starting up...");
+
+  // Initialize tracing before anything else
+  initTracing();
 
   // Initialize SQLite
   getDb();
