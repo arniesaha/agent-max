@@ -3,7 +3,7 @@ import type { AgentTool } from "@mariozechner/pi-agent-core";
 
 // Port 18800: OpenClaw profile (LinkedIn, DoorDash automation)
 // Port 9222: Chrome Debug profile (general browsing)
-const DEFAULT_CDP_PORT = 9222;
+const DEFAULT_CDP_PORT = 18800;
 
 interface CdpTab {
   id: string;
@@ -142,7 +142,7 @@ const SCRAPE_JS = `
 export const browserControl: AgentTool = {
   name: "browser_control",
   label: "Browser Control",
-  description: "Control Chrome via CDP. Actions: list_tabs, navigate, scrape (navigate to URL and extract page text — best for summarizing web pages), evaluate (run JS), screenshot. Port 9222 for debug profile, port 18800 for automation.",
+  description: "Control Chrome via CDP. Actions: list_tabs, navigate, scrape (navigate to URL and extract page text — best for summarizing web pages), evaluate (run JS), screenshot. Port 18800 for automation (default), port 9222 for debug profile.",
   parameters: Type.Object({
     action: Type.Union([
       Type.Literal("list_tabs"),
@@ -151,7 +151,7 @@ export const browserControl: AgentTool = {
       Type.Literal("evaluate"),
       Type.Literal("screenshot"),
     ], { description: "Action to perform" }),
-    port: Type.Optional(Type.Number({ description: "CDP port. 9222 for debug, 18800 for automation. Default: 9222" })),
+    port: Type.Optional(Type.Number({ description: "CDP port. 18800 for automation (default), 9222 for debug." })),
     url: Type.Optional(Type.String({ description: "URL to navigate to (for navigate/scrape action)" })),
     expression: Type.Optional(Type.String({ description: "JavaScript expression to evaluate (for evaluate action)" })),
     tab_index: Type.Optional(Type.Number({ description: "Tab index to target (default: 0)" })),

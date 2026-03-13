@@ -91,6 +91,13 @@ export const browserTask: AgentTool = {
       } else if (isDoorDashTask) {
         return await runDoorDashOrder(task, url);
       } else {
+        // Generic browser-use tasks require ANTHROPIC_API_KEY for the Claude agent
+        if (!process.env.ANTHROPIC_API_KEY) {
+          return {
+            content: [{ type: "text" as const, text: "browser_task (generic) requires ANTHROPIC_API_KEY to be set in .env — the browser-use agent uses Claude for reasoning. Please set this key and restart." }],
+            details: { success: false, error: "ANTHROPIC_API_KEY not set" },
+          };
+        }
         return await runGenericTask(task, url, profile);
       }
     } catch (e: any) {

@@ -1,6 +1,7 @@
 import { Type } from "@mariozechner/pi-ai";
 import type { AgentTool } from "@mariozechner/pi-agent-core";
 import { context, propagation } from "@opentelemetry/api";
+import { log } from "../logger.js";
 
 const NIX_A2A_URL = process.env.NIX_A2A_URL || "http://localhost:8771";
 const A2A_SHARED_SECRET = process.env.A2A_SHARED_SECRET || "";
@@ -22,8 +23,8 @@ export const delegateToNix: AgentTool = {
     const taskId = crypto.randomUUID();
 
     try {
-      // Submit task (sync mode — Nix returns the reply directly)
-      const res = await fetch(`${NIX_A2A_URL}/tasks?sync=true`, {
+      // Submit task async — Nix returns immediately with status "submitted"
+      const res = await fetch(`${NIX_A2A_URL}/tasks`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -38,7 +39,7 @@ export const delegateToNix: AgentTool = {
             parts: [{ type: "text", text: task }],
           },
         }),
-        signal: AbortSignal.timeout(60000),
+        signal: AbortSignal.timeout(15000),
       });
 
       if (!res.ok) {
@@ -49,7 +50,39 @@ export const delegateToNix: AgentTool = {
         };
       }
 
-      const data = await res.json();
+      let data = await res.json();
+      const pollTaskId = data.id || taskId;
+      log("info", `Nix POST response: status=${data.status} id=${pollTaskId}`);
+
+      // Poll until terminal state
+      const TERMINAL_STATES = ["completed", "failed", "canceled", "rejected"];
+      const POLL_INTERVAL = 3000;
+      const MAX_POLL_TIME = 120000; // 2 minutes
+      const pollStart = Date.now();
+
+      while (!TERMINAL_STATES.includes(data.status) && Date.now() - pollStart < MAX_POLL_TIME) {
+        await new Promise((r) => setTimeout(r, POLL_INTERVAL));
+
+        const pollRes = await fetch(`${NIX_A2A_URL}/tasks/${pollTaskId}`, {
+          method: "GET",
+          headers: { ...authHeaders },
+          signal: AbortSignal.timeout(10000),
+        });
+
+        if (!pollRes.ok) {
+          throw new Error(`Nix poll returned ${pollRes.status}`);
+        }
+
+        data = await pollRes.json();
+        log("info", `Nix poll: status=${data.status} hasReply=${!!data.result?.reply} elapsed=${Math.round((Date.now() - pollStart) / 1000)}s`);
+      }
+
+      if (!TERMINAL_STATES.includes(data.status)) {
+        return {
+          content: [{ type: "text" as const, text: "Nix is still processing the task after 2 minutes. It may complete later." }],
+          details: { success: false, taskId: pollTaskId, status: data.status },
+        };
+      }
 
       if (data.status === "failed") {
         throw new Error(data.error || "Nix task failed");
