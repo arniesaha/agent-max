@@ -1,10 +1,11 @@
 {
   "name": "agent-max",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Max - autonomous agent for Mac Mini",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
+    "test": "NODE_OPTIONS='--experimental-vm-modules' jest",
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "nodemon --exec tsx src/index.ts",
@@ -28,10 +29,15 @@
     "ws": "^8.19.0"
   },
   "devDependencies": {
+    "@opentelemetry/context-async-hooks": "^1.30.0",
+    "@opentelemetry/sdk-trace-base": "^1.30.0",
     "@types/better-sqlite3": "latest",
     "@types/express": "latest",
+    "@types/jest": "^29.5.14",
     "@types/node": "latest",
+    "jest": "^29.7.0",
     "nodemon": "latest",
+    "ts-jest": "^29.2.0",
     "tsx": "latest",
     "typescript": "^5.0.0"
   }
