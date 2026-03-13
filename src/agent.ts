@@ -11,6 +11,8 @@ import { browserControl } from "./tools/browser.js";
 import { linkedinSearch, linkedinResults } from "./tools/linkedin.js";
 import { iosListDevices, iosBuild, iosInstall, iosBuildAndDeploy } from "./tools/ios-deploy.js";
 import { launchpadRunScraper, launchpadDeploy } from "./tools/launchpad.js";
+import { launchpadScrape } from "./tools/launchpad-scrape.js";
+import { browserTask } from "./tools/browser-task.js";
 import { runShell } from "./tools/shell.js";
 import { createContextInfoTool } from "./tools/context-info.js";
 import { transformContext } from "./context.js";
@@ -30,7 +32,9 @@ const staticTools: AgentTool[] = [
   // iOS
   iosListDevices, iosBuild, iosInstall, iosBuildAndDeploy,
   // Launchpad
-  launchpadRunScraper, launchpadDeploy,
+  launchpadRunScraper, launchpadDeploy, launchpadScrape,
+  // browser-use agentic tasks
+  browserTask,
   // Shell
   runShell,
 ];
@@ -55,6 +59,8 @@ export async function createAgent(): Promise<Agent> {
   const systemPrompt = await loadMemory();
 
   // Wrap streamSimple to inject AgentWeave proxy auth + tracing header
+  // Only send Authorization for Anthropic — Google uses query param auth
+  // and the Bearer token would conflict with Google's API
   const proxyToken = process.env.AGENTWEAVE_PROXY_TOKEN;
   const agentWeaveStreamFn: typeof streamSimple = (m, ctx, opts) =>
     streamSimple(m, ctx, {
@@ -62,7 +68,9 @@ export async function createAgent(): Promise<Agent> {
       headers: {
         ...opts?.headers,
         "X-AgentWeave-Agent-Id": "max-v1",
-        ...(proxyToken ? { Authorization: `Bearer ${proxyToken}` } : {}),
+        "X-AgentWeave-Session-Id": "max-main",
+        "X-AgentWeave-Project": "max",
+        ...(proxyToken && provider === "anthropic" ? { Authorization: `Bearer ${proxyToken}` } : {}),
       },
     });
 
