@@ -45,12 +45,20 @@ export function traceTools(tools: AgentTool[]): AgentTool[] {
 
 /**
  * Run an async function inside an agent turn span.
+ * Optionally accepts session and Telegram message metadata for correlation.
  */
-export function traceAgentTurn<T>(name: string, fn: () => T | Promise<T>): T | Promise<T> {
+export function traceAgentTurn<T>(
+  name: string,
+  fn: () => T | Promise<T>,
+  meta?: { sessionId?: string; telegramMessageId?: number; chatId?: number }
+): T | Promise<T> {
   if (!AgentWeaveConfig.enabled) return fn();
   return withSpan(`agent.${name}`, {
     [PROV_ACTIVITY_TYPE]: ACTIVITY_AGENT_TURN,
     [PROV_AGENT_ID]: "max-v1",
     [PROV_WAS_ASSOCIATED_WITH]: "max-v1",
+    ...(meta?.sessionId ? { 'session.id': meta.sessionId, 'prov.session.id': meta.sessionId } : {}),
+    ...(meta?.telegramMessageId ? { 'telegram.message_id': String(meta.telegramMessageId) } : {}),
+    ...(meta?.chatId ? { 'telegram.chat_id': String(meta.chatId) } : {}),
   }, () => fn());
 }

@@ -4,6 +4,22 @@ import type { AgentEvent } from "@mariozechner/pi-agent-core";
 import { writeMemoryEvent } from "./memory.js";
 import { createTask, updateTaskStatus, getRecentTasks } from "./task-journal.js";
 import { log } from "./logger.js";
+import { traceAgentTurn } from "./tracing.js";
+
+// ── Deduplication — Issue #2 ─────────────────────────────────────────────────
+const processedUpdateIds = new Set<number>();
+const MAX_PROCESSED_IDS = 500;
+
+function markProcessed(updateId: number): boolean {
+  if (processedUpdateIds.has(updateId)) return false; // already seen
+  processedUpdateIds.add(updateId);
+  if (processedUpdateIds.size > MAX_PROCESSED_IDS) {
+    // Remove oldest entry (Sets preserve insertion order)
+    processedUpdateIds.delete(processedUpdateIds.values().next().value!);
+  }
+  return true; // first time seeing this
+}
+// ─────────────────────────────────────────────────────────────────────────────
 
 const ALLOWED_USERS = (process.env.TELEGRAM_ALLOWED_USERS || "").split(",").map((s) => s.trim()).filter(Boolean);
 
@@ -465,14 +481,32 @@ export function createTelegramBot(agent: Agent): Bot {
   // Text messages
   bot.on("message:text", async (ctx) => {
     if (!isAllowed(ctx)) return;
-    await handleMessage(ctx, ctx.message.text);
+    const updateId = ctx.update.update_id;
+    if (!markProcessed(updateId)) {
+      log("warn", `Duplicate update ${updateId} ignored`);
+      return;
+    }
+    const sessionId = `tg-${ctx.chat.id}`;
+    const telegramMessageId = ctx.message.message_id;
+    const chatId = ctx.chat.id;
+    await traceAgentTurn("handleMessage", async () => {
+      await handleMessage(ctx, ctx.message.text);
+    }, { sessionId, telegramMessageId, chatId });
   });
 
   // Photo messages (with optional caption)
   bot.on("message:photo", async (ctx) => {
     if (!isAllowed(ctx)) return;
+    const updateId = ctx.update.update_id;
+    if (!markProcessed(updateId)) {
+      log("warn", `Duplicate update ${updateId} ignored`);
+      return;
+    }
 
     const caption = ctx.message.caption || "What do you see in this image?";
+    const sessionId = `tg-${ctx.chat.id}`;
+    const telegramMessageId = ctx.message.message_id;
+    const chatId = ctx.chat.id;
 
     try {
       // Get the largest photo (last in the array)
@@ -491,7 +525,9 @@ export function createTelegramBot(agent: Agent): Bot {
       const ext = file.file_path?.split(".").pop()?.toLowerCase() || "jpg";
       const mimeType = ext === "png" ? "image/png" : ext === "gif" ? "image/gif" : ext === "webp" ? "image/webp" : "image/jpeg";
 
-      await handleMessage(ctx, caption, [{ type: "image", data: base64, mimeType }]);
+      await traceAgentTurn("handleMessage", async () => {
+        await handleMessage(ctx, caption, [{ type: "image", data: base64, mimeType }]);
+      }, { sessionId, telegramMessageId, chatId });
     } catch (e: any) {
       log("error", `Failed to process photo: ${e.message}`);
       await ctx.reply(`Failed to process image: ${e.message}`);
