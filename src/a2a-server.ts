@@ -2,12 +2,15 @@ import express from "express";
 import type { Agent } from "@mariozechner/pi-agent-core";
 import type { AgentEvent } from "@mariozechner/pi-agent-core";
 import { createTask, updateTaskStatus, getRecentTasks, getDb } from "./task-journal.js";
+import { setAgentWeaveSession, resetAgentWeaveSession } from "./agentweave-context.js";
 import { log } from "./logger.js";
 
 const A2A_PORT = parseInt(process.env.A2A_PORT || "8770", 10);
 const A2A_SHARED_SECRET = process.env.A2A_SHARED_SECRET || "";
 const A2A_TASK_TIMEOUT_MS = 180_000; // 3 minutes max per A2A task
 const startTime = Date.now();
+
+const AGENTWEAVE_MAX_PROXY = 'http://192.168.1.70:30401';
 
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -73,6 +76,14 @@ export function createA2AServer(agent: Agent): express.Express {
   // A2A Task submission
   app.post("/tasks", authMiddleware, async (req, res) => {
     let taskId: string | undefined;
+
+    // Extract AgentWeave context from incoming request (set by Nix)
+    const parentSessionId = req.headers['x-agentweave-parent-session-id'] as string | undefined;
+    const delegatedSessionId = req.headers['x-agentweave-delegated-session-id'] as string | undefined;
+    const callerAgentId = req.headers['x-agentweave-agent-id'] as string | undefined;
+    const taskLabel = req.headers['x-agentweave-task-label'] as string | undefined;
+    const AGENTWEAVE_PROXY_TOKEN = process.env.AGENTWEAVE_PROXY_TOKEN;
+
     try {
       const { params } = req.body;
       if (!params?.message?.parts?.[0]?.text) {
@@ -86,6 +97,30 @@ export function createA2AServer(agent: Agent): express.Express {
       const task = createTask("a2a_task", "nix", { text, metadata: params.metadata });
       taskId = task.id;
       updateTaskStatus(task.id, "working");
+
+      // Set AgentWeave session context if parent session is provided
+      if (parentSessionId) {
+        const sessionId = delegatedSessionId || `max-a2a-${task.id}`;
+        try {
+          await fetch(`${AGENTWEAVE_MAX_PROXY}/session`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              ...(AGENTWEAVE_PROXY_TOKEN ? { 'Authorization': `Bearer ${AGENTWEAVE_PROXY_TOKEN}` } : {}),
+            },
+            body: JSON.stringify({
+              session_id: sessionId,
+              parent_session_id: parentSessionId,
+              task_label: taskLabel || `a2a from ${callerAgentId || 'nix'}`,
+              agent_type: 'delegated',
+            }),
+          });
+          log('info', `AgentWeave session set: ${sessionId} (parent: ${parentSessionId})`);
+          setAgentWeaveSession(sessionId);
+        } catch (e: any) {
+          log('warn', `AgentWeave session set failed: ${e.message}`);
+        }
+      }
 
       // Run agent
       let responseText = "";
@@ -131,6 +166,24 @@ export function createA2AServer(agent: Agent): express.Express {
         id: req.body?.id,
         error: { code: -32000, message: e.message },
       });
+    } finally {
+      // Restore Max's default session after delegated task completes
+      if (parentSessionId) {
+        resetAgentWeaveSession();
+        fetch(`${AGENTWEAVE_MAX_PROXY}/session`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(AGENTWEAVE_PROXY_TOKEN ? { 'Authorization': `Bearer ${AGENTWEAVE_PROXY_TOKEN}` } : {}),
+          },
+          body: JSON.stringify({
+            session_id: 'max-main',
+            parent_session_id: '',
+            task_label: '',
+            agent_type: 'main',
+          }),
+        }).catch(() => {});
+      }
     }
   });
 

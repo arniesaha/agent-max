@@ -2,6 +2,7 @@ import { Type } from "@mariozechner/pi-ai";
 import type { AgentTool } from "@mariozechner/pi-agent-core";
 import { context, propagation } from "@opentelemetry/api";
 import { log } from "../logger.js";
+import { getAgentWeaveSession } from "../agentweave-context.js";
 
 const NIX_A2A_URL = process.env.NIX_A2A_URL || "http://localhost:8771";
 const A2A_SHARED_SECRET = process.env.A2A_SHARED_SECRET || "";
@@ -13,7 +14,7 @@ const authHeaders: Record<string, string> = A2A_SHARED_SECRET
 export const delegateToNix: AgentTool = {
   name: "delegate_to_nix",
   label: "Delegate to Nix",
-  description: "Send a task to Nix agent on NAS via A2A protocol. Use for: memory lookups, sending WhatsApp, scheduling cron jobs. Available skills: send_telegram, recall_search, schedule_cron, memory_query, general.",
+  description: "Send a task to Nix agent on the NAS via A2A protocol. Use this tool when: (1) asked to search memory or recall notes, (2) sending WhatsApp/Telegram messages, (3) scheduling cron jobs, (4) accessing NAS files, (5) explicitly told to use this tool or 'ask Nix'. Available skills: send_telegram, recall_search, schedule_cron, memory_query, general.",
   parameters: Type.Object({
     task: Type.String({ description: "Task description for Nix" }),
     skill_id: Type.Optional(Type.String({ description: "Nix skill to invoke: send_telegram, recall_search, schedule_cron, memory_query, general. Defaults to general." })),
@@ -30,6 +31,11 @@ export const delegateToNix: AgentTool = {
           "Content-Type": "application/json",
           ...authHeaders,
           ...(() => { const h: Record<string, string> = {}; propagation.inject(context.active(), h); return h; })(),
+          // AgentWeave session attribution for trace propagation
+          "X-AgentWeave-Parent-Session-Id": getAgentWeaveSession(),
+          "X-AgentWeave-Delegated-Session-Id": `nix-a2a-${taskId}`,
+          "X-AgentWeave-Agent-Id": process.env.AGENTWEAVE_AGENT_ID || "max-v1",
+          "X-AgentWeave-Task-Label": `a2a:${skill_id || "general"}:${task.slice(0, 50)}`,
         },
         body: JSON.stringify({
           id: taskId,
