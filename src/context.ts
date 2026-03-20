@@ -13,8 +13,10 @@ function estimateMessageTokens(msg: AgentMessage): number {
   const m = msg as Message;
   if (m.role === "assistant") {
     const am = m as AssistantMessage;
-    // Use actual token count if available
-    if (am.usage?.totalTokens) return am.usage.totalTokens;
+    // Use output tokens as the message size estimate (NOT totalTokens which
+    // includes input context and would make every assistant message appear as
+    // 800k+ tokens, triggering runaway compaction)
+    if (am.usage?.output) return am.usage.output;
   }
   // Estimate from content
   let chars = 0;
@@ -100,6 +102,14 @@ export async function transformContext(messages: AgentMessage[]): Promise<AgentM
     keepFrom++;
     keptTokens -= estimateMessageTokens(messages[keepFrom - 1]);
   }
+
+  // Ensure toKeep starts at a user message boundary — orphaned toolResult or
+  // assistant messages without their preceding context break model APIs.
+  while (keepFrom < messages.length && (messages[keepFrom] as Message).role !== "user") {
+    keepFrom++;
+  }
+  // If we couldn't find a user message, keep at least the last message
+  if (keepFrom >= messages.length) keepFrom = messages.length - 1;
 
   const toCompact = messages.slice(0, keepFrom);
   const toKeep = messages.slice(keepFrom);

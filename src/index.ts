@@ -32,8 +32,9 @@ async function main() {
     }
   }
 
-  // Create agent
+  // Create agent (also restores previous session)
   const agent = await createAgent();
+  log("info", `Agent ready with ${agent.state.messages.length} messages in context`);
 
   // Start A2A server
   startA2AServer(agent);

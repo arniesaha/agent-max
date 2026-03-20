@@ -5,6 +5,7 @@ import { writeMemoryEvent } from "./memory.js";
 import { createTask, updateTaskStatus, getRecentTasks } from "./task-journal.js";
 import { log } from "./logger.js";
 import { traceAgentTurn } from "./tracing.js";
+import { saveSession, clearSession } from "./session.js";
 
 // ── Deduplication — Issue #2 ─────────────────────────────────────────────────
 const processedUpdateIds = new Set<number>();
@@ -27,17 +28,6 @@ const STREAM_EDIT_INTERVAL_MS = 1200;
 const TYPING_INTERVAL_MS = 4000;
 const STATUS_MIN_INTERVAL_MS = 800; // min gap between status edits to avoid Telegram 429
 const MAX_MSG_LEN = 4000;
-const PROMPT_TIMEOUT_MS = 180_000; // 3 minutes max per prompt
-
-function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms / 1000}s`)), ms);
-    promise.then(
-      (v) => { clearTimeout(timer); resolve(v); },
-      (e) => { clearTimeout(timer); reject(e); },
-    );
-  });
-}
 
 interface ConversationEntry {
   role: "user" | "assistant";
@@ -247,11 +237,27 @@ export function createTelegramBot(agent: Agent): Bot {
     if (!isAllowed(ctx)) return;
     conversationHistory.length = 0;
     agent.clearMessages();
+    clearSession();
     await ctx.reply("Conversation context cleared.");
   });
 
   // Core message handler — processes text with optional images
   async function handleMessage(ctx: Context, text: string, images?: { type: "image"; data: string; mimeType: string }[]) {
+    // If agent is already running a request, abort it and wait for completion
+    if (agent.state.isStreaming) {
+      log("info", "Aborting previous agent run before starting new request");
+      agent.abort();
+      const abortDeadline = Date.now() + 5000;
+      while (agent.state.isStreaming && Date.now() < abortDeadline) {
+        await new Promise(r => setTimeout(r, 100));
+      }
+      if (agent.state.isStreaming) {
+        log("warn", "Abort timed out, agent still streaming");
+        await ctx.reply("⏳ Max is still busy with a previous task. Please wait a moment.");
+        return;
+      }
+    }
+
     log("info", `Telegram message from ${ctx.from?.id}: ${text.slice(0, 100)}${images?.length ? ` (+${images.length} image${images.length > 1 ? "s" : ""})` : ""}`);
 
     conversationHistory.push({ role: "user", text, timestamp: Date.now() });
@@ -276,6 +282,10 @@ export function createTelegramBot(agent: Agent): Bot {
     let pendingStatusEdit: ReturnType<typeof setTimeout> | null = null;
     const pendingImages: { data: string; mimeType: string; caption?: string }[] = [];
     const toolLog: string[] = []; // accumulates completed tool labels
+
+    // Rolling message split state
+    let currentMsgId = messageId;
+    const allChunks: string[] = []; // finalized chunks for history reconstruction
 
     // Rate-limited status edit — pushes immediately if enough time elapsed, else schedules
     const editStatus = (newLabel: string) => {
@@ -331,24 +341,50 @@ export function createTelegramBot(agent: Agent): Bot {
     }, TYPING_INTERVAL_MS);
     bot.api.sendChatAction(chatId, "typing").catch(() => {});
 
-    // Spinner animation + stream text edits
+    // Spinner animation + stream text edits (with rolling message split)
     const startEditing = () => {
       editTimer = setInterval(async () => {
         if (responseText.length > 0) {
-          // Streaming text — rate-limited edits with HTML formatting
+          // Streaming text — check if we need to split into a new message
+          if (responseText.length > MAX_MSG_LEN) {
+            // Find a good split point
+            let splitAt = responseText.lastIndexOf("\n", MAX_MSG_LEN);
+            if (splitAt < MAX_MSG_LEN / 2) splitAt = MAX_MSG_LEN;
+            const chunk = responseText.slice(0, splitAt);
+            const remainder = responseText.slice(splitAt);
+
+            // Finalize current message with the chunk (no cursor)
+            try {
+              await bot.api.editMessageText(chatId, currentMsgId, mdToHtml(chunk), { parse_mode: "HTML" });
+            } catch {
+              try { await bot.api.editMessageText(chatId, currentMsgId, chunk); } catch {}
+            }
+            allChunks.push(chunk);
+
+            // Send a new message for the remainder
+            try {
+              const newMsg = await bot.api.sendMessage(chatId, remainder + " ▍");
+              currentMsgId = newMsg.message_id;
+              responseText = remainder;
+              lastEditedText = remainder;
+            } catch (e: any) {
+              log("warn", `Failed to send continuation message: ${e.message}`);
+            }
+            return;
+          }
+
+          // Normal streaming edit
           if (responseText === lastEditedText) return;
-          const truncated = responseText.length > MAX_MSG_LEN
-            ? responseText.slice(0, MAX_MSG_LEN) + "..."
-            : responseText + " ▍";
+          const display = responseText + " ▍";
 
           try {
-            await bot.api.editMessageText(chatId, messageId, mdToHtml(truncated), { parse_mode: "HTML" });
+            await bot.api.editMessageText(chatId, currentMsgId, mdToHtml(display), { parse_mode: "HTML" });
             lastEditedText = responseText;
           } catch (e: any) {
             if (e.message?.includes("message is not modified")) return;
-            // HTML failed mid-stream (unclosed tags etc.) — fall back to plain
+            // HTML failed mid-stream — fall back to plain
             try {
-              await bot.api.editMessageText(chatId, messageId, truncated);
+              await bot.api.editMessageText(chatId, currentMsgId, display);
               lastEditedText = responseText;
             } catch (e2: any) {
               if (!e2.message?.includes("message is not modified")) {
@@ -417,7 +453,7 @@ export function createTelegramBot(agent: Agent): Bot {
       });
 
       startEditing();
-      await withTimeout(agent.prompt(text, images), PROMPT_TIMEOUT_MS, "Agent prompt");
+      await agent.prompt(text, images);
       unsub();
 
       if (editTimer) clearInterval(editTimer);
@@ -434,17 +470,30 @@ export function createTelegramBot(agent: Agent): Bot {
         }
       }
 
+      if (!responseText) {
+        const msgCount = agent.state.messages.length;
+        const lastRole = msgCount > 0 ? (agent.state.messages[msgCount - 1] as any).role : "none";
+        log("warn", `Empty response after prompt. Messages: ${msgCount}, last role: ${lastRole}`);
+      }
+
       responseText = responseText || "(no response)";
 
-      // Final edit with HTML formatting
+      // Final edit — finalize the current (possibly split) message
       if (responseText.length <= MAX_MSG_LEN) {
-        await editWithFormat(bot, chatId, messageId, responseText);
+        await editWithFormat(bot, chatId, currentMsgId, responseText);
       } else {
+        // Still too long after streaming — split remaining
         const chunks = splitMessage(responseText, MAX_MSG_LEN);
-        await editWithFormat(bot, chatId, messageId, chunks[0]);
+        await editWithFormat(bot, chatId, currentMsgId, chunks[0]);
         for (let i = 1; i < chunks.length; i++) {
           await replyWithFormat(ctx, chunks[i]);
         }
+      }
+
+      // Reconstruct full response for conversation history
+      if (allChunks.length > 0) {
+        allChunks.push(responseText);
+        responseText = allChunks.join("");
       }
 
       // Send any captured images as photos
@@ -463,15 +512,17 @@ export function createTelegramBot(agent: Agent): Bot {
       trimHistory();
 
       updateTaskStatus(task.id, "completed", { response: responseText.slice(0, 500) });
+      saveSession(agent);
       await writeMemoryEvent(`Telegram conversation with user ${ctx.from?.id}: "${text.slice(0, 80)}"`);
     } catch (e: any) {
       if (editTimer) clearInterval(editTimer);
       if (typingTimer) clearInterval(typingTimer);
       if (pendingStatusEdit) clearTimeout(pendingStatusEdit);
+      agent.abort(); // stop runaway background execution
       log("error", `Agent error: ${e.message}`);
       updateTaskStatus(task.id, "failed", { error: e.message });
       try {
-        await bot.api.editMessageText(chatId, messageId, `❌ Error: ${e.message}`);
+        await bot.api.editMessageText(chatId, currentMsgId, `❌ Error: ${e.message}`);
       } catch {
         await ctx.reply(`❌ Error: ${e.message}`);
       }

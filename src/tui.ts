@@ -93,6 +93,12 @@ class MaxTUI {
       }
       return undefined;
     });
+
+    // Fallback SIGINT handler
+    process.on("SIGINT", () => this.shutdown());
+
+    // Escape to exit
+    this.input.onEscape = () => this.shutdown();
   }
 
   async start() {
@@ -107,6 +113,30 @@ class MaxTUI {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const health = await res.json() as any;
       this.statusText.setText(dim(` Connected · uptime ${health.uptime}s · ${health.messagesInContext} messages in context`));
+
+      // Fetch and render existing conversation history
+      try {
+        const msgRes = await fetch(`${BASE_URL}/messages`, { headers });
+        if (msgRes.ok) {
+          const { messages } = await msgRes.json() as any;
+          if (messages && messages.length > 0) {
+            for (const msg of messages) {
+              if (!msg.text) continue;
+              if (msg.role === "user") {
+                this.responseArea.addChild(new Text(bold(green(" > ")) + msg.text, 0, 0));
+                this.responseArea.addChild(new Text("", 0, 0));
+              } else if (msg.role === "assistant") {
+                this.responseArea.addChild(new Markdown(msg.text, 1, 0, markdownTheme));
+                this.responseArea.addChild(new Text("", 0, 0));
+              }
+            }
+            this.responseArea.addChild(new Text(dim("─".repeat(40) + " session history ─"), 0, 0));
+            this.responseArea.addChild(new Text("", 0, 0));
+          }
+        }
+      } catch {
+        // non-critical — just skip history
+      }
     } catch (e: any) {
       this.statusText.setText(yellow(` Could not reach Max at ${BASE_URL} — is the agent running?`));
     }
@@ -114,6 +144,10 @@ class MaxTUI {
   }
 
   private async handleSubmit(text: string) {
+    if (text === "/exit") {
+      this.shutdown();
+      return;
+    }
     if (this.isStreaming) return;
     this.isStreaming = true;
 

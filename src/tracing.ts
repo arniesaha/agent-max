@@ -1,5 +1,9 @@
 import { AgentWeaveConfig, traceTool, withSpan } from "agentweave";
-import { PROV_ACTIVITY_TYPE, ACTIVITY_AGENT_TURN, PROV_AGENT_ID, PROV_WAS_ASSOCIATED_WITH } from "agentweave";
+import {
+  PROV_ACTIVITY_TYPE, ACTIVITY_AGENT_TURN,
+  PROV_AGENT_ID, PROV_WAS_ASSOCIATED_WITH,
+  PROV_AGENT_TYPE, AGENT_TYPE_MAIN,
+} from "agentweave";
 import type { AgentTool } from "@mariozechner/pi-agent-core";
 import { log } from "./logger.js";
 
@@ -45,7 +49,8 @@ export function traceTools(tools: AgentTool[]): AgentTool[] {
 
 /**
  * Run an async function inside an agent turn span.
- * Optionally accepts session and Telegram message metadata for correlation.
+ * Sets prov.agent.type: main so the session graph correctly identifies
+ * Max as a main agent. Uses SDK v0.3.0 AGENT_TYPE_MAIN constant.
  */
 export function traceAgentTurn<T>(
   name: string,
@@ -57,6 +62,7 @@ export function traceAgentTurn<T>(
     [PROV_ACTIVITY_TYPE]: ACTIVITY_AGENT_TURN,
     [PROV_AGENT_ID]: "max-v1",
     [PROV_WAS_ASSOCIATED_WITH]: "max-v1",
+    [PROV_AGENT_TYPE]: AGENT_TYPE_MAIN,
     ...(meta?.sessionId ? { 'session.id': meta.sessionId, 'prov.session.id': meta.sessionId } : {}),
     ...(meta?.telegramMessageId ? { 'telegram.message_id': String(meta.telegramMessageId) } : {}),
     ...(meta?.chatId ? { 'telegram.chat_id': String(meta.chatId) } : {}),

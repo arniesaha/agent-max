@@ -4,23 +4,13 @@ import type { AgentEvent } from "@mariozechner/pi-agent-core";
 import { createTask, updateTaskStatus, getRecentTasks, getDb } from "./task-journal.js";
 import { setAgentWeaveSession, resetAgentWeaveSession } from "./agentweave-context.js";
 import { log } from "./logger.js";
+import { saveSession } from "./session.js";
 
 const A2A_PORT = parseInt(process.env.A2A_PORT || "8770", 10);
 const A2A_SHARED_SECRET = process.env.A2A_SHARED_SECRET || "";
-const A2A_TASK_TIMEOUT_MS = 180_000; // 3 minutes max per A2A task
 const startTime = Date.now();
 
 const AGENTWEAVE_MAX_PROXY = 'http://192.168.1.70:30401';
-
-function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms / 1000}s`)), ms);
-    promise.then(
-      (v) => { clearTimeout(timer); resolve(v); },
-      (e) => { clearTimeout(timer); reject(e); },
-    );
-  });
-}
 
 const AGENT_CARD = {
   name: "Max",
@@ -75,6 +65,11 @@ export function createA2AServer(agent: Agent): express.Express {
 
   // A2A Task submission
   app.post("/tasks", authMiddleware, async (req, res) => {
+    if (agent.state.isStreaming) {
+      res.status(409).json({ error: "Agent is busy processing another request" });
+      return;
+    }
+
     let taskId: string | undefined;
 
     // Extract AgentWeave context from incoming request (set by Nix)
@@ -130,7 +125,7 @@ export function createA2AServer(agent: Agent): express.Express {
         }
       });
 
-      await withTimeout(agent.prompt(text), A2A_TASK_TIMEOUT_MS, "A2A task");
+      await agent.prompt(text);
       unsub();
 
       if (!responseText) {
@@ -144,6 +139,7 @@ export function createA2AServer(agent: Agent): express.Express {
       }
 
       updateTaskStatus(task.id, "completed", { response: responseText });
+      saveSession(agent);
 
       res.json({
         jsonrpc: "2.0",
@@ -159,6 +155,7 @@ export function createA2AServer(agent: Agent): express.Express {
         },
       });
     } catch (e: any) {
+      agent.abort();
       log("error", `A2A task error: ${e.message}`);
       if (taskId) updateTaskStatus(taskId, "failed", { error: e.message });
       res.status(500).json({
@@ -189,6 +186,11 @@ export function createA2AServer(agent: Agent): express.Express {
 
   // Streaming task submission (SSE)
   app.post("/tasks/stream", authMiddleware, async (req, res) => {
+    if (agent.state.isStreaming) {
+      res.status(409).json({ error: "Agent is busy processing another request" });
+      return;
+    }
+
     try {
       const { params } = req.body;
       if (!params?.message?.parts?.[0]?.text) {
@@ -243,7 +245,7 @@ export function createA2AServer(agent: Agent): express.Express {
         }
       });
 
-      await withTimeout(agent.prompt(text), A2A_TASK_TIMEOUT_MS, "A2A stream task");
+      await agent.prompt(text);
       unsub();
 
       // Extract final response
@@ -257,9 +259,11 @@ export function createA2AServer(agent: Agent): express.Express {
       }
 
       updateTaskStatus(task.id, "completed", { response: responseText });
+      saveSession(agent);
       sendEvent("task_end", { taskId: task.id });
       res.end();
     } catch (e: any) {
+      agent.abort();
       log("error", `A2A stream error: ${e.message}`);
       try {
         res.write(`event: error\ndata: ${JSON.stringify({ message: e.message })}\n\n`);
@@ -268,6 +272,24 @@ export function createA2AServer(agent: Agent): express.Express {
         // response already closed
       }
     }
+  });
+
+  // Messages — returns conversation history
+  app.get("/messages", authMiddleware, (_req, res) => {
+    const messages = agent.state.messages
+      .filter((m: any) => m.role === "user" || m.role === "assistant")
+      .map((m: any) => {
+        const text = typeof m.content === "string"
+          ? m.content
+          : Array.isArray(m.content)
+            ? m.content
+                .filter((c: any) => c.type === "text")
+                .map((c: any) => c.text)
+                .join("")
+            : "";
+        return { role: m.role, text };
+      });
+    res.json({ messages });
   });
 
   // Task status query

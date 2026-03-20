@@ -17,6 +17,7 @@ import { runShell } from "./tools/shell.js";
 import { createContextInfoTool } from "./tools/context-info.js";
 import { transformContext } from "./context.js";
 import { traceTools } from "./tracing.js";
+import { restoreSession } from "./session.js";
 
 const staticTools: AgentTool[] = [
   // GPU
@@ -91,6 +92,9 @@ export async function createAgent(): Promise<Agent> {
   // Add agent-bound tools, wrapped with tracing spans
   const allTools = traceTools([...staticTools, createContextInfoTool(agent)]);
   agent.state.tools = allTools;
+
+  // Restore previous session messages
+  restoreSession(agent);
 
   return agent;
 }
