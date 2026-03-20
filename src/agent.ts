@@ -68,9 +68,10 @@ export async function createAgent(): Promise<Agent> {
       headers: {
         ...opts?.headers,
         "X-AgentWeave-Agent-Id": "max-v1",
+                "X-AgentWeave-Agent-Type": "main",
         "X-AgentWeave-Session-Id": "max-main",
         "X-AgentWeave-Project": "max",
-        ...(proxyToken && provider === "anthropic" ? { Authorization: `Bearer ${proxyToken}` } : {}),
+        ...(proxyToken ? { "X-AgentWeave-Proxy-Token": proxyToken } : {}),
       },
     });
 
