@@ -91,10 +91,16 @@ export const delegateToNix: AgentTool = {
       }
 
       if (data.status === "failed") {
-        throw new Error(data.error || "Nix task failed");
+        const errMsg = data.error || "Nix task failed (no error details)";
+        return {
+          content: [{ type: "text" as const, text: `Nix task failed: ${errMsg}` }],
+          details: { success: false, taskId: pollTaskId, error: errMsg },
+        };
       }
 
-      const replyText = data.result?.reply || "(Nix completed but returned no reply)";
+      const replyText = data.result?.reply
+        || data.result?.parts?.filter((p: any) => p.type === "text").map((p: any) => p.text).join("\n")
+        || "(Nix completed but returned no reply)";
 
       return {
         content: [{ type: "text" as const, text: replyText }],

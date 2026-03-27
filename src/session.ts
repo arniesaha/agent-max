@@ -9,36 +9,42 @@ const MAX_SESSION_MESSAGES = 20; // only save the most recent messages
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 
 /**
- * Truncate large tool results and limit message count before saving,
- * to prevent session restore from immediately exceeding the compaction threshold.
+ * Truncate large tool results, strip thinking blocks, and limit message count
+ * before saving. Ensures the saved sequence starts at a user message boundary
+ * so restored sessions produce valid API requests.
  */
 function trimForStorage(messages: AgentMessage[]): AgentMessage[] {
-  // Only keep the most recent messages
-  const recent = messages.slice(-MAX_SESSION_MESSAGES);
+  // Find a starting point within the last MAX_SESSION_MESSAGES that begins with a user message
+  let startIdx = Math.max(0, messages.length - MAX_SESSION_MESSAGES);
+  while (startIdx < messages.length && (messages[startIdx] as any).role !== "user") {
+    startIdx++;
+  }
+  if (startIdx >= messages.length) return [];
+
+  const recent = messages.slice(startIdx);
   return recent.map((msg) => {
     const m = msg as any;
     if (m.role === "toolResult" && Array.isArray(m.content)) {
       const trimmedContent = m.content.map((c: any) => {
         if (c.type === "text" && c.text && c.text.length > MAX_TOOL_RESULT_CHARS) {
-          return { ...c, text: c.text.slice(0, MAX_TOOL_RESULT_CHARS) + "\n...[truncated for session storage]" };
+          return { ...c, text: c.text.slice(0, MAX_TOOL_RESULT_CHARS) + "\n...[truncated]" };
         }
         if (c.type === "image") {
-          // Drop image data from saved sessions (too large)
           return { type: "text", text: "[image omitted from session storage]" };
         }
         return c;
       });
       return { ...m, content: trimmedContent };
     }
-    // Also truncate large assistant thinking blocks
+    // Strip thinking blocks entirely — they contain signatures that break
+    // when truncated, and the model doesn't need them for continuity.
     if (m.role === "assistant" && Array.isArray(m.content)) {
-      const trimmedContent = m.content.map((c: any) => {
-        if (c.type === "thinking" && c.thinking && c.thinking.length > MAX_TOOL_RESULT_CHARS) {
-          return { ...c, thinking: c.thinking.slice(0, MAX_TOOL_RESULT_CHARS) + "\n...[truncated]" };
-        }
-        return c;
-      });
-      return { ...m, content: trimmedContent };
+      const filtered = m.content.filter((c: any) => c.type !== "thinking");
+      if (filtered.length === 0) {
+        // Thinking-only response — replace with a minimal text block
+        return { ...m, content: [{ type: "text", text: "(thinking)" }] };
+      }
+      return { ...m, content: filtered };
     }
     return msg;
   });

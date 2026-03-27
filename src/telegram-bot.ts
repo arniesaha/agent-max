@@ -447,6 +447,11 @@ export function createTelegramBot(agent: Agent): Bot {
           case "turn_start":
             if (responseText.length === 0) {
               editStatus("⏳ Thinking");
+            } else {
+              // Separate text from consecutive turns with a blank line
+              if (!responseText.endsWith("\n\n")) {
+                responseText += responseText.endsWith("\n") ? "\n" : "\n\n";
+              }
             }
             break;
         }
