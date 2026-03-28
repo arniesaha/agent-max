@@ -10,7 +10,7 @@ const A2A_PORT = parseInt(process.env.A2A_PORT || "8770", 10);
 const A2A_SHARED_SECRET = process.env.A2A_SHARED_SECRET || "";
 const startTime = Date.now();
 
-const AGENTWEAVE_MAX_PROXY = 'http://192.168.1.70:30401';
+const AGENTWEAVE_MAX_PROXY = process.env.AGENTWEAVE_PROXY_URL || 'http://192.168.1.70:30400';
 
 const AGENT_CARD = {
   name: "Max",
