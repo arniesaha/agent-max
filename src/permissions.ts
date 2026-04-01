@@ -33,7 +33,7 @@ let _rules: PermissionRule[] = [...DEFAULT_DENY_RULES];
 async function loadExtraRules(): Promise<void> {
   if (_extraRulesLoaded) return;
   _extraRulesLoaded = true;
-  const permFile = path.join(process.env.HOME!, "max", "permissions.json");
+  const permFile = path.join(process.env.HOME ?? "/tmp", "max", "permissions.json");
   try {
     const raw = await readFile(permFile, "utf-8");
     const extra: PermissionRule[] = JSON.parse(raw);
