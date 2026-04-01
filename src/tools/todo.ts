@@ -13,7 +13,7 @@ export interface Todo {
   updatedAt: number;
 }
 
-const TODOS_PATH = path.join(process.env.HOME!, "max", "data", "todos.json");
+const TODOS_PATH = path.join(process.env.HOME ?? "/tmp", "max", "data", "todos.json");
 
 async function readTodos(): Promise<Todo[]> {
   try {
