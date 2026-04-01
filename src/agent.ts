@@ -15,9 +15,11 @@ import { launchpadScrape } from "./tools/launchpad-scrape.js";
 import { browserTask } from "./tools/browser-task.js";
 import { runShell } from "./tools/shell.js";
 import { createContextInfoTool } from "./tools/context-info.js";
+import { manageTodos } from "./tools/todo.js";
 import { transformContext } from "./context.js";
 import { traceTools } from "./tracing.js";
 import { restoreSession } from "./session.js";
+import { checkPermission } from "./permissions.js";
 
 const staticTools: AgentTool[] = [
   // GPU
@@ -38,6 +40,8 @@ const staticTools: AgentTool[] = [
   browserTask,
   // Shell
   runShell,
+  // Todos
+  manageTodos,
 ];
 
 export async function createAgent(): Promise<Agent> {
@@ -89,8 +93,24 @@ export async function createAgent(): Promise<Agent> {
     streamFn: agentWeaveStreamFn,
   });
 
-  // Add agent-bound tools, wrapped with tracing spans
-  const allTools = traceTools([...staticTools, createContextInfoTool(agent)]);
+  // Wrap tools with permission checks before tracing
+  function withPermissionCheck(tool: AgentTool): AgentTool {
+    const originalExecute = tool.execute;
+    return {
+      ...tool,
+      execute: async (toolCallId: string, params: unknown, signal?: AbortSignal, onUpdate?: any) => {
+        const result = await checkPermission(tool.name, params);
+        if (!result.allowed) {
+          log("warn", `Tool call denied: ${tool.name} — ${result.reason}`);
+          return { content: [{ type: "text" as const, text: `Tool call denied: ${result.reason}` }], details: {} };
+        }
+        return originalExecute(toolCallId, params as any, signal, onUpdate);
+      },
+    };
+  }
+
+  // Add agent-bound tools, wrapped with permission checks and tracing spans
+  const allTools = traceTools([...staticTools, createContextInfoTool(agent)].map(withPermissionCheck));
   agent.state.tools = allTools;
 
   // Restore previous session messages
