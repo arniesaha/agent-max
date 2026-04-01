@@ -155,12 +155,16 @@ export async function transformContext(messages: AgentMessage[]): Promise<AgentM
   // Attempt LLM-generated summary
   async function buildLLMSummary(msgs: AgentMessage[]): Promise<string | null> {
     try {
-      const defaultModel = process.env.DEFAULT_MODEL || "gemini-2.5-pro";
+      const defaultModel = process.env.DEFAULT_MODEL ?? "gemini-2.5-pro";
       const provider = defaultModel.startsWith("claude") ? "anthropic" : "google";
       const model = getModel(provider as any, defaultModel as any);
       if (!model) return null;
 
-      const historyText = buildHeuristicSummary(msgs);
+      const MAX_HISTORY_CHARS = 50_000;
+      let historyText = buildHeuristicSummary(msgs);
+      if (historyText.length > MAX_HISTORY_CHARS) {
+        historyText = historyText.slice(0, MAX_HISTORY_CHARS) + "\n[...truncated]";
+      }
       const prompt = `Summarize the following conversation history concisely. Focus on: decisions made, tools called and key outcomes, errors encountered, current state of any ongoing work, and any important context needed to continue. Be specific and include relevant values, paths, and statuses.\n\n${historyText}`;
 
       const apiKey = getEnvApiKey(provider as any);
@@ -169,17 +173,26 @@ export async function transformContext(messages: AgentMessage[]): Promise<AgentM
         { messages: [{ role: "user", content: prompt, timestamp: Date.now() }] },
         { apiKey }
       );
-      let summary = "";
-      for await (const event of stream) {
-        if (event.type === "text_delta") {
-          summary += event.delta;
-        } else if (event.type === "done") {
-          // finished
-          break;
-        } else if (event.type === "error") {
-          throw new Error(event.error?.errorMessage ?? "LLM compaction error");
+
+      const LLM_TIMEOUT_MS = 30_000;
+      const consumeStream = async (): Promise<string> => {
+        let summary = "";
+        for await (const event of stream) {
+          if (event.type === "text_delta") {
+            summary += event.delta;
+          } else if (event.type === "done") {
+            break;
+          } else if (event.type === "error") {
+            throw new Error(event.error?.errorMessage ?? "LLM compaction error");
+          }
         }
-      }
+        return summary;
+      };
+      const timeout = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("LLM compaction timed out after 30s")), LLM_TIMEOUT_MS)
+      );
+      const summary = await Promise.race([consumeStream(), timeout]);
+
       return summary.trim() || null;
     } catch (err) {
       log("warn", `LLM compaction summary failed, falling back to heuristic: ${err}`);
