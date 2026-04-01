@@ -1,5 +1,6 @@
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import type { AssistantMessage, Message } from "@mariozechner/pi-ai";
+import { getModel, getEnvApiKey, streamSimple } from "@mariozechner/pi-ai";
 import { log } from "./logger.js";
 
 const CONTEXT_WINDOW = 1_000_000;
@@ -116,40 +117,81 @@ export async function transformContext(messages: AgentMessage[]): Promise<AgentM
 
   if (toCompact.length === 0) return messages;
 
-  // Build summary from compacted messages
-  const summaryParts: string[] = ["[Context compacted — summary of earlier conversation:]"];
+  // Build heuristic summary as fallback
+  function buildHeuristicSummary(msgs: AgentMessage[]): string {
+    const parts: string[] = ["[Context compacted — summary of earlier conversation:]"];
+    for (const msg of msgs) {
+      const m = msg as Message;
+      if (m.role === "user") {
+        const text = typeof m.content === "string"
+          ? m.content
+          : m.content.filter(c => c.type === "text").map(c => (c as any).text).join(" ");
+        if (text.length > 0) {
+          parts.push(`User: ${text.slice(0, 300)}${text.length > 300 ? "..." : ""}`);
+        }
+      } else if (m.role === "assistant") {
+        const texts = m.content
+          .filter(c => c.type === "text")
+          .map(c => (c as any).text)
+          .join(" ");
+        const toolCalls = m.content
+          .filter(c => c.type === "toolCall")
+          .map(c => (c as any).name)
+          .join(", ");
+        if (toolCalls) {
+          parts.push(`Assistant: [called: ${toolCalls}] ${texts.slice(0, 200)}${texts.length > 200 ? "..." : ""}`);
+        } else if (texts.length > 0) {
+          parts.push(`Assistant: ${texts.slice(0, 300)}${texts.length > 300 ? "..." : ""}`);
+        }
+      } else if (m.role === "toolResult") {
+        const text = m.content.filter(c => c.type === "text").map(c => (c as any).text).join(" ");
+        const status = (m as any).isError ? "ERROR" : "OK";
+        parts.push(`Tool ${(m as any).toolName} [${status}]: ${text.slice(0, 200)}${text.length > 200 ? "..." : ""}`);
+      }
+    }
+    return parts.join("\n");
+  }
 
-  for (const msg of toCompact) {
-    const m = msg as Message;
-    if (m.role === "user") {
-      const text = typeof m.content === "string"
-        ? m.content
-        : m.content.filter(c => c.type === "text").map(c => (c as any).text).join(" ");
-      if (text.length > 0) {
-        summaryParts.push(`User: ${text.slice(0, 300)}${text.length > 300 ? "..." : ""}`);
+  // Attempt LLM-generated summary
+  async function buildLLMSummary(msgs: AgentMessage[]): Promise<string | null> {
+    try {
+      const defaultModel = process.env.DEFAULT_MODEL || "gemini-2.5-pro";
+      const provider = defaultModel.startsWith("claude") ? "anthropic" : "google";
+      const model = getModel(provider as any, defaultModel as any);
+      if (!model) return null;
+
+      const historyText = buildHeuristicSummary(msgs);
+      const prompt = `Summarize the following conversation history concisely. Focus on: decisions made, tools called and key outcomes, errors encountered, current state of any ongoing work, and any important context needed to continue. Be specific and include relevant values, paths, and statuses.\n\n${historyText}`;
+
+      const apiKey = getEnvApiKey(provider as any);
+      const stream = streamSimple(
+        model,
+        { messages: [{ role: "user", content: prompt, timestamp: Date.now() }] },
+        { apiKey }
+      );
+      let summary = "";
+      for await (const event of stream) {
+        if (event.type === "text_delta") {
+          summary += event.delta;
+        } else if (event.type === "done") {
+          // finished
+          break;
+        } else if (event.type === "error") {
+          throw new Error(event.error?.errorMessage ?? "LLM compaction error");
+        }
       }
-    } else if (m.role === "assistant") {
-      const texts = m.content
-        .filter(c => c.type === "text")
-        .map(c => (c as any).text)
-        .join(" ");
-      const toolCalls = m.content
-        .filter(c => c.type === "toolCall")
-        .map(c => (c as any).name)
-        .join(", ");
-      if (toolCalls) {
-        summaryParts.push(`Assistant: [called: ${toolCalls}] ${texts.slice(0, 200)}${texts.length > 200 ? "..." : ""}`);
-      } else if (texts.length > 0) {
-        summaryParts.push(`Assistant: ${texts.slice(0, 300)}${texts.length > 300 ? "..." : ""}`);
-      }
-    } else if (m.role === "toolResult") {
-      const text = m.content.filter(c => c.type === "text").map(c => (c as any).text).join(" ");
-      const status = m.isError ? "ERROR" : "OK";
-      summaryParts.push(`Tool ${m.toolName} [${status}]: ${text.slice(0, 200)}${text.length > 200 ? "..." : ""}`);
+      return summary.trim() || null;
+    } catch (err) {
+      log("warn", `LLM compaction summary failed, falling back to heuristic: ${err}`);
+      return null;
     }
   }
 
-  const summaryText = summaryParts.join("\n");
+  const timestamp = new Date().toISOString();
+  const llmSummary = await buildLLMSummary(toCompact);
+  const summaryText = llmSummary
+    ? `[CONTEXT SUMMARY — compacted at ${timestamp}]\n\n${llmSummary}`
+    : buildHeuristicSummary(toCompact);
   const summaryMessage: AgentMessage = {
     role: "user",
     content: summaryText,
