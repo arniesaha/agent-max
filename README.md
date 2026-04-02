@@ -1,10 +1,14 @@
 # Agent Max
 
-A self-hosted AI agent — an opinionated pi-mono fork with A2A, browser automation, and distributed compute. Max handles browser automation, GPU management, file operations, and delegates tasks to companion agents via the A2A (Agent-to-Agent) protocol.
+Self-hosted AI agent. Opinionated fork of [pi-mono](https://github.com/nicememe-studio/pi-mono) with A2A, browser automation, and distributed compute.
+
+## Philosophy
+
+Agent state (plans, todos, memory) lives in plain markdown files, not structured tools or hooks. The agent reads and writes `.md` files directly. No JSON state machines, no tool-call interception, no confirmation flows. Keep it light.
 
 ## Architecture
 
-Max runs alongside companion agents (e.g. Nix on a NAS). All agents expose A2A servers and communicate bidirectionally. Users interact through Telegram.
+Max communicates with companion agents via A2A (Agent-to-Agent) protocol. Users interact through Telegram.
 
 ```mermaid
 graph LR
@@ -14,21 +18,16 @@ graph LR
         Max["Max Agent<br/>Pi Mono + A2A :8770"]
     end
 
-    subgraph nas["NAS"]
-        Nix["NAS Agent<br/>OpenClaw + A2A :8771"]
+    subgraph companion["Companion Agents"]
+        Nix["Nix<br/>A2A :8771"]
     end
 
     User <-->|Telegram| Max
-    User <-->|Telegram| Nix
     Max <-->|A2A| Nix
 
     Max -->|CDP| Chrome["Chrome<br/>Browser"]
-    Max -->|WoL / Ollama / Shutdown| GPU["GPU PC"]
-    Max -->|SSH| NAS_FS["NAS Filesystem"]
-
-    Nix --> Recall["Recall<br/>Memory"]
-    Nix --> Cron["Cron<br/>Scheduler"]
-    Nix --> TG["Telegram<br/>Messaging"]
+    Max -->|WoL / Ollama| GPU["GPU PC"]
+    Max -->|SSH| Remote["Remote Hosts"]
 ```
 
 ## Tools
@@ -36,13 +35,14 @@ graph LR
 | Tool | Description |
 |------|-------------|
 | `browser_control` | Chrome automation via CDP |
+| `browser_task` | Agentic browser tasks (browser-use) |
 | `wake_gpu` / `shutdown_gpu` / `gpu_status` | GPU PC power management (WoL + Ollama) |
-| `ssh_to_nas` | Run commands on the NAS via SSH |
-| `delegate_to_nix` | Send tasks to the NAS agent via A2A |
+| `ssh_to_nas` | Run commands on remote hosts via SSH |
+| `delegate_to_nix` | Send tasks to companion agents via A2A |
 | `read_file` / `write_file` / `list_files` | Local filesystem operations |
 | `run_shell` | Execute shell commands |
 | `linkedin_search` / `linkedin_results` | LinkedIn scraping |
-| `launchpad_run_scraper` / `launchpad_deploy` | Launchpad automation |
+| `launchpad_run_scraper` / `launchpad_deploy` / `launchpad_scrape` | Launchpad automation |
 | `ios_list_devices` / `ios_build` / `ios_install` | iOS build and deploy |
 | `context_info` | Agent context and state info |
 
@@ -61,14 +61,14 @@ npm start
 
 See `.env.example` for the full list. Key variables:
 
-- `GOOGLE_API_KEY` / `ANTHROPIC_API_KEY` — LLM provider keys
-- `TELEGRAM_BOT_TOKEN` / `TELEGRAM_ALLOWED_USERS` — Telegram bot config
-- `A2A_PORT` — Port for the A2A server (default: 8770)
-- `A2A_SHARED_SECRET` — Shared secret for A2A auth between agents
-- `NIX_A2A_URL` — URL of the companion NAS agent
-- `NAS_HOST` / `NAS_USER` — NAS SSH access
-- `GPU_HOST` / `GPU_WOL_URL` / `GPU_SHUTDOWN_TOKEN` — GPU PC management
-- `MAX_A2A_URL` — Public URL for this agent's A2A card
+- `GOOGLE_API_KEY` / `ANTHROPIC_API_KEY` - LLM provider keys
+- `TELEGRAM_BOT_TOKEN` / `TELEGRAM_ALLOWED_USERS` - Telegram bot config
+- `A2A_PORT` - A2A server port (default: 8770)
+- `A2A_SHARED_SECRET` - Shared secret for A2A auth between agents
+- `NIX_A2A_URL` - URL of companion agent
+- `NAS_HOST` / `NAS_USER` - NAS SSH access
+- `GPU_HOST` / `GPU_WOL_URL` / `GPU_SHUTDOWN_TOKEN` - GPU PC management
+- `MAX_A2A_URL` - Public URL for this agent's A2A card
 
 ### Development
 
@@ -81,10 +81,10 @@ npm run tui   # Interactive TUI client
 
 Max exposes an A2A server for receiving tasks from other agents:
 
-- `GET /.well-known/agent.json` — Agent card (public)
-- `GET /health` — Health check (public)
-- `POST /tasks` — Submit a task (auth required)
-- `POST /tasks/stream` — Submit with SSE streaming (auth required)
-- `GET /tasks/:id` — Query task status (auth required)
+- `GET /.well-known/agent.json` - Agent card (public)
+- `GET /health` - Health check (public)
+- `POST /tasks` - Submit a task (auth required)
+- `POST /tasks/stream` - Submit with SSE streaming (auth required)
+- `GET /tasks/:id` - Query task status (auth required)
 
 Auth uses `Authorization: Bearer <A2A_SHARED_SECRET>`.
