@@ -1,16 +1,16 @@
 # Agent Max
 
-A self-hosted autonomous agent that runs on a Mac Mini, designed to work as part of a distributed multi-agent system. Max handles browser automation, GPU management, file operations, and delegates tasks to a companion NAS agent via the A2A (Agent-to-Agent) protocol.
+A self-hosted AI agent — an opinionated pi-mono fork with A2A, browser automation, and distributed compute. Max handles browser automation, GPU management, file operations, and delegates tasks to companion agents via the A2A (Agent-to-Agent) protocol.
 
 ## Architecture
 
-Max runs on a Mac Mini alongside a companion agent (Nix) on a NAS. Both expose A2A servers and communicate bidirectionally. Users interact with both agents through Telegram.
+Max runs alongside companion agents (e.g. Nix on a NAS). All agents expose A2A servers and communicate bidirectionally. Users interact through Telegram.
 
 ```mermaid
 graph LR
     User["User<br/>(Telegram)"]
 
-    subgraph mac["Mac Mini"]
+    subgraph host["Host"]
         Max["Max Agent<br/>Pi Mono + A2A :8770"]
     end
 

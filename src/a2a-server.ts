@@ -14,7 +14,7 @@ const AGENTWEAVE_MAX_PROXY = process.env.AGENTWEAVE_PROXY_URL || 'http://192.168
 
 const AGENT_CARD = {
   name: "Max",
-  description: "Local compute and browser agent on Mac Mini",
+  description: "Self-hosted AI agent with browser automation and distributed compute",
   url: process.env.MAX_A2A_URL || `http://localhost:${A2A_PORT}`,
   capabilities: {
     streaming: true,
