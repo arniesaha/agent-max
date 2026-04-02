@@ -1,7 +1,6 @@
 import { readFile, writeFile, mkdir } from "fs/promises";
 import { existsSync } from "fs";
 import path from "path";
-import { loadActiveTodos } from "./tools/todo.js";
 
 const MAX_HOME = path.join(process.env.HOME!, "max");
 const MEMORY_DIR = path.join(MAX_HOME, "memory");
@@ -47,15 +46,9 @@ You communicate via Telegram. Your responses are rendered with rich formatting. 
 
 Keep responses concise but visually scannable. Use formatting to create structure, not walls of plain text.`;
 
-  // Append active todos to system prompt
-  const activeTodos = await loadActiveTodos();
-  let todoSection = "";
-  if (activeTodos.length > 0) {
-    const lines = activeTodos.map((t) => `- [${t.status}] ${t.task}`);
-    todoSection = `## Active Tasks\n${lines.join("\n")}`;
-  }
+  const todos = await readFileSafe(path.join(MAX_HOME, "data", "todos.md"));
 
-  return [soul, longTermMem, formatting, yesterdayMem, todayMem, todoSection].filter(Boolean).join("\n\n---\n\n");
+  return [soul, longTermMem, formatting, yesterdayMem, todayMem, todos].filter(Boolean).join("\n\n---\n\n");
 }
 
 export async function writeMemoryEvent(event: string): Promise<void> {
