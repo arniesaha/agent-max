@@ -15,6 +15,7 @@ import { launchpadScrape } from "./tools/launchpad-scrape.js";
 import { browserTask } from "./tools/browser-task.js";
 import { runShell } from "./tools/shell.js";
 import { manageTodos } from "./tools/todo.js";
+import { delegateToClaudeSubagent } from "./tools/claude-subagent.js";
 import { createContextInfoTool } from "./tools/context-info.js";
 import { transformContext } from "./context.js";
 import { traceTools } from "./tracing.js";
@@ -42,6 +43,8 @@ const staticTools: AgentTool[] = [
   runShell,
   // Todos
   manageTodos,
+  // Claude Code delegation
+  delegateToClaudeSubagent,
 ];
 
 export async function createAgent(): Promise<Agent> {

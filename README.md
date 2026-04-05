@@ -41,6 +41,7 @@ graph LR
 | `delegate_to_nix` | Send tasks to the NAS agent via A2A |
 | `read_file` / `write_file` / `list_files` | Local filesystem operations |
 | `run_shell` | Execute shell commands |
+| `delegate_to_claude_subagent` | Launch Claude Code subagent jobs asynchronously with AgentWeave attribution |
 | `linkedin_search` / `linkedin_results` | LinkedIn scraping |
 | `launchpad_run_scraper` / `launchpad_deploy` | Launchpad automation |
 | `ios_list_devices` / `ios_build` / `ios_install` | iOS build and deploy |
@@ -62,6 +63,7 @@ npm start
 See `.env.example` for the full list. Key variables:
 
 - `GOOGLE_API_KEY` / `ANTHROPIC_API_KEY` — LLM provider keys
+- `CLAUDE_SUBAGENT_MODEL` — Claude model used by `delegate_to_claude_subagent` (default: `claude-sonnet-4-6`)
 - `TELEGRAM_BOT_TOKEN` / `TELEGRAM_ALLOWED_USERS` — Telegram bot config
 - `A2A_PORT` — Port for the A2A server (default: 8770)
 - `A2A_SHARED_SECRET` — Shared secret for A2A auth between agents
@@ -69,6 +71,26 @@ See `.env.example` for the full list. Key variables:
 - `NAS_HOST` / `NAS_USER` — NAS SSH access
 - `GPU_HOST` / `GPU_WOL_URL` / `GPU_SHUTDOWN_TOKEN` — GPU PC management
 - `MAX_A2A_URL` — Public URL for this agent's A2A card
+
+### Claude Code subagent delegation
+
+`delegate_to_claude_subagent` runs Claude Code in a background process so Max can stay responsive.
+
+- `action=start` launches a job and immediately returns `job_id`
+- `action=status` returns current state plus output
+- `action=list` shows recent jobs
+
+For AgentWeave trace linking, Max injects the following headers into the child Claude process via `ANTHROPIC_CUSTOM_HEADERS`:
+
+- `X-AgentWeave-Session-Id` (child)
+- `X-AgentWeave-Parent-Session-Id` (current Max session)
+- `X-AgentWeave-Agent-Id`
+- `X-AgentWeave-Agent-Type=subagent`
+- `X-AgentWeave-Task-Label`
+
+Requirements:
+- `claude` CLI installed and authenticated on the host
+- `ANTHROPIC_BASE_URL` should point to your AgentWeave proxy if you want subagent LLM calls visible in AgentWeave
 
 ### Development
 
