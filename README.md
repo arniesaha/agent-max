@@ -77,10 +77,15 @@ See `.env.example` for the full list. Key variables:
 `delegate_to_claude_subagent` runs Claude Code in a background process so Max can stay responsive.
 
 - `action=start` launches a job and immediately returns `job_id`
-- `action=status` returns current state plus output
-- `action=list` shows recent jobs
+- `action=status` returns current state plus output (falls back to disk if job was evicted from memory)
+- `action=list` shows the 10 most recent in-memory jobs
 
-For AgentWeave trace linking, Max injects the following headers into the child Claude process via `ANTHROPIC_CUSTOM_HEADERS`:
+**Lifecycle:**
+- Jobs are killed via `SIGTERM` after `CLAUDE_SUBAGENT_TIMEOUT_MS` (default: 5 minutes) and marked `timed_out`
+- In-memory store is capped at 50 jobs; oldest finished jobs are evicted first
+- Each job's state is persisted to `~/.max-subagent-jobs/<jobId>.json` so `action=status` works across agent restarts
+
+**AgentWeave trace attribution** — Max injects the following into the child Claude process via `ANTHROPIC_CUSTOM_HEADERS`:
 
 - `X-AgentWeave-Session-Id` (child)
 - `X-AgentWeave-Parent-Session-Id` (current Max session)
@@ -88,9 +93,12 @@ For AgentWeave trace linking, Max injects the following headers into the child C
 - `X-AgentWeave-Agent-Type=subagent`
 - `X-AgentWeave-Task-Label`
 
-Requirements:
+**Security note:** Subagents run with `--permission-mode bypassPermissions`, which allows the Claude CLI to perform file and shell operations without interactive confirmation. This is intentional for local trusted environments. Do not expose this agent to untrusted users or inputs.
+
+**Requirements:**
 - `claude` CLI installed and authenticated on the host
 - `ANTHROPIC_BASE_URL` should point to your AgentWeave proxy if you want subagent LLM calls visible in AgentWeave
+- `CLAUDE_SUBAGENT_TIMEOUT_MS` — optional, milliseconds before a job is killed (default: `300000`)
 
 ### Development
 

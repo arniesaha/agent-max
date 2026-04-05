@@ -1,10 +1,12 @@
 import { Type } from "@mariozechner/pi-ai";
 import type { AgentTool } from "@mariozechner/pi-agent-core";
-import { spawn } from "child_process";
+import { spawn, ChildProcess } from "child_process";
+import { writeFileSync, readFileSync, existsSync, mkdirSync } from "fs";
+import { join } from "path";
 import { log } from "../logger.js";
 import { getAgentWeaveSession } from "../agentweave-context.js";
 
-type DelegateJobStatus = "running" | "completed" | "failed";
+type DelegateJobStatus = "running" | "completed" | "failed" | "timed_out";
 
 type DelegateJob = {
   id: string;
@@ -21,11 +23,65 @@ type DelegateJob = {
 };
 
 const jobs = new Map<string, DelegateJob>();
-const MAX_OUTPUT_CHARS = 15000;
+const processes = new Map<string, ChildProcess>();
+
+export const MAX_OUTPUT_CHARS = 15000;
+const MAX_JOBS = 50;
 const DEFAULT_MODEL = process.env.CLAUDE_SUBAGENT_MODEL || "claude-sonnet-4-6";
 
-function truncateOutput(text: string): string {
+/**
+ * Timeout in ms before a running subagent is killed.
+ * Configurable via CLAUDE_SUBAGENT_TIMEOUT_MS (default: 5 minutes).
+ *
+ * Note: subagents run with --permission-mode bypassPermissions, which allows
+ * the Claude CLI to perform file/shell operations without interactive prompts.
+ * This is intentional for local trusted environments — do not expose this
+ * agent to untrusted users or inputs.
+ */
+const JOB_TIMEOUT_MS = parseInt(process.env.CLAUDE_SUBAGENT_TIMEOUT_MS || "300000", 10);
+
+// Persist job state to ~/.max-subagent-jobs/<jobId>.json so status survives restarts.
+const JOBS_DIR = join(process.env.HOME || ".", ".max-subagent-jobs");
+try {
+  if (!existsSync(JOBS_DIR)) mkdirSync(JOBS_DIR, { recursive: true });
+} catch {}
+
+function persistJob(job: DelegateJob): void {
+  try {
+    writeFileSync(join(JOBS_DIR, `${job.id}.json`), JSON.stringify(job, null, 2), "utf8");
+  } catch (err) {
+    log("warn", `claude_subagent: failed to persist job ${job.id}: ${err}`);
+  }
+}
+
+function loadJobFromDisk(jobId: string): DelegateJob | undefined {
+  const diskPath = join(JOBS_DIR, `${jobId}.json`);
+  if (!existsSync(diskPath)) return undefined;
+  try {
+    return JSON.parse(readFileSync(diskPath, "utf8")) as DelegateJob;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Evict oldest completed/failed/timed_out jobs when we hit the cap.
+ * Running jobs are never evicted.
+ */
+export function evictOldJobs(): void {
+  if (jobs.size < MAX_JOBS) return;
+  const finished = [...jobs.values()]
+    .filter((j) => j.status !== "running")
+    .sort((a, b) => a.startedAt - b.startedAt);
+  const toEvict = finished.slice(0, jobs.size - MAX_JOBS + 1);
+  for (const j of toEvict) {
+    jobs.delete(j.id);
+  }
+}
+
+export function truncateOutput(text: string): string {
   if (text.length <= MAX_OUTPUT_CHARS) return text;
+  // Keep the tail — most recent output is most useful
   return text.slice(text.length - MAX_OUTPUT_CHARS);
 }
 
@@ -35,7 +91,18 @@ function makeCustomHeaders(headers: Record<string, string>): string {
     .join("\n");
 }
 
+function onJobComplete(job: DelegateJob): void {
+  const elapsedSec = Math.round(((job.endedAt || Date.now()) - job.startedAt) / 1000);
+  log(
+    "info",
+    `claude_subagent ${job.id} finished: status=${job.status} elapsed=${elapsedSec}s label="${job.taskLabel}"`
+  );
+  persistJob(job);
+}
+
 function startClaudeDelegation(prompt: string, taskLabel?: string): DelegateJob {
+  evictOldJobs();
+
   const jobId = crypto.randomUUID();
   const parentSessionId = getAgentWeaveSession();
   const childSessionId = `max-claude-subagent-${jobId}`;
@@ -74,6 +141,9 @@ function startClaudeDelegation(prompt: string, taskLabel?: string): DelegateJob 
     output: "",
   };
 
+  jobs.set(job.id, job);
+  persistJob(job); // write initial "running" state immediately
+
   const claude = spawn(
     "claude",
     ["--print", "--permission-mode", "bypassPermissions", "--model", DEFAULT_MODEL, prompt],
@@ -84,29 +154,49 @@ function startClaudeDelegation(prompt: string, taskLabel?: string): DelegateJob 
     }
   );
 
-  claude.stdout.on("data", (chunk) => {
+  processes.set(jobId, claude);
+
+  // Kill and mark timed_out if the subagent runs too long
+  const timeoutHandle = setTimeout(() => {
+    if (job.status !== "running") return;
+    log("warn", `claude_subagent ${job.id} timed out after ${JOB_TIMEOUT_MS / 1000}s — killing`);
+    claude.kill("SIGTERM");
+    job.status = "timed_out";
+    job.error = `Timed out after ${JOB_TIMEOUT_MS / 1000}s`;
+    job.endedAt = Date.now();
+    processes.delete(jobId);
+    onJobComplete(job);
+  }, JOB_TIMEOUT_MS);
+
+  claude.stdout.on("data", (chunk: Buffer) => {
     job.output = truncateOutput(job.output + chunk.toString("utf8"));
   });
 
-  claude.stderr.on("data", (chunk) => {
+  claude.stderr.on("data", (chunk: Buffer) => {
     job.output = truncateOutput(job.output + chunk.toString("utf8"));
   });
 
-  claude.on("error", (err) => {
+  claude.on("error", (err: Error) => {
+    clearTimeout(timeoutHandle);
     job.status = "failed";
     job.error = err.message;
     job.endedAt = Date.now();
-    log("error", `claude_subagent spawn failed (${job.id}): ${err.message}`);
+    processes.delete(jobId);
+    onJobComplete(job);
   });
 
-  claude.on("close", (code) => {
-    job.exitCode = code;
-    job.endedAt = Date.now();
-    job.status = code === 0 ? "completed" : "failed";
-    log("info", `claude_subagent ${job.id} finished with code ${code}`);
+  claude.on("close", (code: number | null) => {
+    clearTimeout(timeoutHandle);
+    // Don't overwrite timed_out status set by the timeout handler
+    if (job.status === "running") {
+      job.exitCode = code;
+      job.endedAt = Date.now();
+      job.status = code === 0 ? "completed" : "failed";
+    }
+    processes.delete(jobId);
+    onJobComplete(job);
   });
 
-  jobs.set(job.id, job);
   return job;
 }
 
@@ -132,7 +222,9 @@ export const delegateToClaudeSubagent: AgentTool = {
   name: "delegate_to_claude_subagent",
   label: "Delegate to Claude Code Subagent",
   description:
-    "Run a Claude Code subagent task asynchronously. Use action=start to launch a background Claude CLI process with AgentWeave session attribution, then action=status to retrieve output/results.",
+    "Run a Claude Code subagent task asynchronously. Use action=start to launch a background Claude CLI process " +
+    "with AgentWeave session attribution, then action=status to retrieve output/results. " +
+    `Jobs are killed after ${JOB_TIMEOUT_MS / 1000}s if still running.`,
   parameters: Type.Object({
     action: Type.String({ description: "start | status | list" }),
     prompt: Type.Optional(Type.String({ description: "Task prompt for action=start" })),
@@ -158,7 +250,8 @@ export const delegateToClaudeSubagent: AgentTool = {
             type: "text" as const,
             text:
               `Started Claude subagent job ${job.id}. ` +
-              `Use delegate_to_claude_subagent with action=status and job_id=${job.id} to fetch progress/result.`,
+              `Use action=status with job_id=${job.id} to check progress. ` +
+              `Will be killed after ${JOB_TIMEOUT_MS / 1000}s if still running.`,
           },
         ],
         details: {
@@ -168,6 +261,7 @@ export const delegateToClaudeSubagent: AgentTool = {
           childSessionId: job.childSessionId,
           parentSessionId: job.parentSessionId,
           taskLabel: job.taskLabel,
+          timeoutSec: JOB_TIMEOUT_MS / 1000,
         },
       };
     }
@@ -181,7 +275,8 @@ export const delegateToClaudeSubagent: AgentTool = {
         };
       }
 
-      const job = jobs.get(jobId);
+      // In-memory first, then fall back to disk (survives restarts)
+      const job = jobs.get(jobId) ?? loadJobFromDisk(jobId);
       if (!job) {
         return {
           content: [{ type: "text" as const, text: `Unknown job_id: ${jobId}` }],
@@ -222,6 +317,8 @@ export const delegateToClaudeSubagent: AgentTool = {
   },
 };
 
+// ─── Test helpers (exported for unit tests only) ──────────────────────────────
+
 export function _buildAnthropicCustomHeadersForTest(input: {
   childSessionId: string;
   parentSessionId: string;
@@ -237,4 +334,10 @@ export function _buildAnthropicCustomHeadersForTest(input: {
     "X-AgentWeave-Task-Label": input.taskLabel,
     ...(input.proxyToken ? { "X-AgentWeave-Proxy-Token": input.proxyToken } : {}),
   });
+}
+
+/** Reset in-memory job store between tests */
+export function _clearJobsForTest(): void {
+  jobs.clear();
+  processes.clear();
 }
