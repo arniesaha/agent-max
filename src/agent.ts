@@ -1,6 +1,6 @@
 import { Agent } from "@mariozechner/pi-agent-core";
-import { getModel, getEnvApiKey, streamSimple, type Message } from "@mariozechner/pi-ai";
-import type { AgentMessage, AgentTool } from "@mariozechner/pi-agent-core";
+import { getModel, getEnvApiKey, streamSimple } from "@mariozechner/pi-ai";
+import type { AgentTool } from "@mariozechner/pi-agent-core";
 import { loadMemory } from "./memory.js";
 import { log } from "./logger.js";
 import { wakeGpu, shutdownGpu, gpuStatus } from "./tools/gpu.js";
@@ -47,9 +47,35 @@ const staticTools: AgentTool[] = [
   delegateToClaudeSubagent,
 ];
 
-export async function createAgent(): Promise<Agent> {
-  const defaultModel = process.env.DEFAULT_MODEL || "gemini-2.5-pro";
-  const provider = defaultModel.startsWith("claude") ? "anthropic" : "google";
+function inferProvider(modelId: string): "anthropic" | "google" {
+  return modelId.startsWith("claude") ? "anthropic" : "google";
+}
+
+function createMuxModel(requestedModel: string) {
+  const openAiBaseModel = getModel("openai" as any, "gpt-4.1-mini" as any);
+  if (!openAiBaseModel) {
+    throw new Error("OpenAI base model not found for Mux integration");
+  }
+
+  const muxBaseUrl = process.env.MUX_BASE_URL?.replace(/\/+$/, "");
+  if (!muxBaseUrl) {
+    throw new Error("MUX_BASE_URL is required when MUX_ENABLED=true");
+  }
+
+  const muxModel = {
+    ...openAiBaseModel,
+    id: requestedModel,
+    provider: "openai",
+    api: "openai-completions",
+    baseUrl: muxBaseUrl,
+  } as any;
+
+  log("info", `Mux enabled: routing requested model ${requestedModel} via ${muxBaseUrl}`);
+  return muxModel;
+}
+
+function createDefaultModel(defaultModel: string) {
+  const provider = inferProvider(defaultModel);
   const model = getModel(provider as any, defaultModel as any);
   if (!model) throw new Error(`Model not found: ${provider}/${defaultModel}`);
 
@@ -63,23 +89,34 @@ export async function createAgent(): Promise<Agent> {
     log("info", `Google GenAI base URL overridden to ${(model as any).baseUrl}`);
   }
 
+  return model;
+}
+
+export async function createAgent(): Promise<Agent> {
+  const defaultModel = process.env.DEFAULT_MODEL || "gemini-2.5-pro";
+  const muxEnabled = process.env.MUX_ENABLED === "true";
+  const model = muxEnabled ? createMuxModel(defaultModel) : createDefaultModel(defaultModel);
+
   log("info", `Agent created with ${model.id}`);
   const systemPrompt = await loadMemory();
 
-  // Wrap streamSimple to inject AgentWeave proxy auth + tracing header
-  // Only send Authorization for Anthropic — Google uses query param auth
-  // and the Bearer token would conflict with Google's API
+  // Wrap streamSimple to inject AgentWeave proxy auth + tracing header.
+  // When using Mux, optionally send its API key as Authorization.
+  // Only send AgentWeave proxy token for non-Mux paths to avoid colliding with Mux auth.
   const proxyToken = process.env.AGENTWEAVE_PROXY_TOKEN;
+  const muxApiKey = process.env.MUX_API_KEY;
   const agentWeaveStreamFn: typeof streamSimple = (m, ctx, opts) =>
     streamSimple(m, ctx, {
       ...opts,
       headers: {
         ...opts?.headers,
         "X-AgentWeave-Agent-Id": "max-v1",
-                "X-AgentWeave-Agent-Type": "main",
+        "X-AgentWeave-Agent-Type": "main",
         "X-AgentWeave-Session-Id": "max-main",
         "X-AgentWeave-Project": "max",
-        ...(proxyToken ? { "X-AgentWeave-Proxy-Token": proxyToken } : {}),
+        "X-Runtime": "agent-max",
+        ...(muxEnabled && muxApiKey ? { Authorization: `Bearer ${muxApiKey}` } : {}),
+        ...(!muxEnabled && proxyToken ? { "X-AgentWeave-Proxy-Token": proxyToken } : {}),
       },
     });
 
@@ -91,7 +128,12 @@ export async function createAgent(): Promise<Agent> {
       tools: staticTools, // context_info added after construction
       messages: [],
     },
-    getApiKey: (provider) => getEnvApiKey(provider),
+    getApiKey: (provider) => {
+      if (muxEnabled && provider === "openai") {
+        return process.env.MUX_API_KEY || "mux-no-key";
+      }
+      return getEnvApiKey(provider);
+    },
     transformContext,
     streamFn: agentWeaveStreamFn,
   });

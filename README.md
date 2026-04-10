@@ -62,7 +62,8 @@ npm start
 
 See `.env.example` for the full list. Key variables:
 
-- `GOOGLE_API_KEY` / `ANTHROPIC_API_KEY` — LLM provider keys
+- `GOOGLE_API_KEY` / `ANTHROPIC_API_KEY` — LLM provider keys (used for direct provider mode)
+- `MUX_ENABLED` / `MUX_BASE_URL` / `MUX_API_KEY` — route Max through Mux via an OpenAI-compatible endpoint while preserving the requested model name
 - `CLAUDE_SUBAGENT_MODEL` — Claude model used by `delegate_to_claude_subagent` (default: `claude-sonnet-4-6`)
 - `TELEGRAM_BOT_TOKEN` / `TELEGRAM_ALLOWED_USERS` — Telegram bot config
 - `A2A_PORT` — Port for the A2A server (default: 8770)
@@ -71,6 +72,21 @@ See `.env.example` for the full list. Key variables:
 - `NAS_HOST` / `NAS_USER` — NAS SSH access
 - `GPU_HOST` / `GPU_WOL_URL` / `GPU_SHUTDOWN_TOKEN` — GPU PC management
 - `MAX_A2A_URL` — Public URL for this agent's A2A card
+
+### Mux integration
+
+Set these in `.env` to route Max through Mux:
+
+```bash
+MUX_ENABLED=true
+MUX_BASE_URL=http://<mux-host>:8787/v1
+# optional if Mux later requires auth
+MUX_API_KEY=
+# requested model name Max will send to Mux
+DEFAULT_MODEL=claude-sonnet-4-6
+```
+
+When Mux is enabled, Max switches to the OpenAI-compatible transport internally, keeps the requested model id (for example `claude-sonnet-4-6`), and adds `X-Runtime: agent-max` on requests so Mux can attribute routing decisions by runtime.
 
 ### Claude Code subagent delegation
 
