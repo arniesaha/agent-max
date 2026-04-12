@@ -5,6 +5,7 @@ import { writeFileSync, readFileSync, existsSync, mkdirSync } from "fs";
 import { join } from "path";
 import { log } from "../logger.js";
 import { getAgentWeaveSession } from "../agentweave-context.js";
+import { relayJobCompletionToTelegram } from "../telegram-notify.js";
 
 type DelegateJobStatus = "running" | "completed" | "failed" | "timed_out";
 
@@ -20,6 +21,7 @@ type DelegateJob = {
   exitCode?: number | null;
   output: string;
   error?: string;
+  silent?: boolean;
 };
 
 const jobs = new Map<string, DelegateJob>();
@@ -91,16 +93,52 @@ function makeCustomHeaders(headers: Record<string, string>): string {
     .join("\n");
 }
 
-function onJobComplete(job: DelegateJob): void {
-  const elapsedSec = Math.round(((job.endedAt || Date.now()) - job.startedAt) / 1000);
-  log(
-    "info",
-    `claude_subagent ${job.id} finished: status=${job.status} elapsed=${elapsedSec}s label="${job.taskLabel}"`
-  );
+/**
+ * Called when a subagent job reaches a terminal state (completed/failed/timed_out).
+ * Updates in-memory + disk state, then fires a Telegram notification unless silent.
+ * Also exported for use by the A2A /tasks/callback endpoint (cross-machine callbacks).
+ *
+ * Returns true if the job was found and updated, false if the jobId is unknown.
+ */
+export function receiveCallback(
+  jobId: string,
+  status: "completed" | "failed" | "timed_out",
+  result?: string,
+  error?: string
+): boolean {
+  // Prefer in-memory job; fall back to disk (handles cross-restart callbacks)
+  const job = jobs.get(jobId) ?? loadJobFromDisk(jobId);
+  if (!job) {
+    log("warn", `receiveCallback: unknown job_id ${jobId}`);
+    return false;
+  }
+
+  job.status = status;
+  job.endedAt = job.endedAt ?? Date.now();
+  if (result !== undefined) job.output = result;
+  if (error !== undefined) job.error = error;
+
+  // Re-insert into memory map in case it was loaded from disk
+  jobs.set(jobId, job);
   persistJob(job);
+
+  const elapsedSec = Math.round((job.endedAt - job.startedAt) / 1000);
+  log("info", `claude_subagent ${job.id} finished: status=${status} elapsed=${elapsedSec}s label="${job.taskLabel}"`);
+
+  if (!job.silent) {
+    void relayJobCompletionToTelegram({
+      taskLabel: job.taskLabel,
+      status,
+      durationMs: job.endedAt - job.startedAt,
+      result: job.output,
+      error: job.error,
+    });
+  }
+
+  return true;
 }
 
-function startClaudeDelegation(prompt: string, taskLabel?: string): DelegateJob {
+function startClaudeDelegation(prompt: string, taskLabel?: string, silent?: boolean): DelegateJob {
   evictOldJobs();
 
   const jobId = crypto.randomUUID();
@@ -141,6 +179,7 @@ function startClaudeDelegation(prompt: string, taskLabel?: string): DelegateJob 
     startedAt: Date.now(),
     status: "running",
     output: "",
+    silent: silent ?? false,
   };
 
   jobs.set(job.id, job);
@@ -164,11 +203,9 @@ function startClaudeDelegation(prompt: string, taskLabel?: string): DelegateJob 
     if (job.status !== "running") return;
     log("warn", `claude_subagent ${job.id} timed out after ${JOB_TIMEOUT_MS / 1000}s — killing`);
     claude.kill("SIGTERM");
-    job.status = "timed_out";
-    job.error = `Timed out after ${JOB_TIMEOUT_MS / 1000}s`;
     job.endedAt = Date.now();
     processes.delete(jobId);
-    onJobComplete(job);
+    receiveCallback(jobId, "timed_out", undefined, `Timed out after ${JOB_TIMEOUT_MS / 1000}s`);
   }, JOB_TIMEOUT_MS);
 
   claude.stdout.on("data", (chunk: Buffer) => {
@@ -181,23 +218,24 @@ function startClaudeDelegation(prompt: string, taskLabel?: string): DelegateJob 
 
   claude.on("error", (err: Error) => {
     clearTimeout(timeoutHandle);
-    job.status = "failed";
-    job.error = err.message;
     job.endedAt = Date.now();
     processes.delete(jobId);
-    onJobComplete(job);
+    receiveCallback(jobId, "failed", undefined, err.message);
   });
 
   claude.on("close", (code: number | null) => {
     clearTimeout(timeoutHandle);
     // Don't overwrite timed_out status set by the timeout handler
-    if (job.status === "running") {
-      job.exitCode = code;
-      job.endedAt = Date.now();
-      job.status = code === 0 ? "completed" : "failed";
-    }
+    if (job.status !== "running") return;
+    job.exitCode = code;
+    job.endedAt = Date.now();
     processes.delete(jobId);
-    onJobComplete(job);
+    receiveCallback(
+      jobId,
+      code === 0 ? "completed" : "failed",
+      job.output,
+      code !== 0 ? `Exit code ${code}` : undefined
+    );
   });
 
   return job;
@@ -221,6 +259,38 @@ function summarizeJob(job: DelegateJob): string {
   ].join("\n");
 }
 
+// ─── Test helpers (exported only for unit tests) ──────────────────────────────
+
+export interface HeaderParams {
+  childSessionId: string;
+  parentSessionId: string;
+  agentId: string;
+  taskLabel: string;
+  proxyToken?: string;
+}
+
+export function _buildAnthropicCustomHeadersForTest(params: HeaderParams): string {
+  const headers: Record<string, string> = {
+    "X-AgentWeave-Session-Id": params.childSessionId,
+    "X-AgentWeave-Parent-Session-Id": params.parentSessionId,
+    "X-AgentWeave-Agent-Id": params.agentId,
+    "X-AgentWeave-Agent-Type": "subagent",
+    "X-AgentWeave-Task-Label": params.taskLabel,
+    ...(params.proxyToken ? { "X-AgentWeave-Proxy-Token": params.proxyToken } : {}),
+  };
+  return makeCustomHeaders(headers);
+}
+
+export function _clearJobsForTest(): void {
+  jobs.clear();
+}
+
+export function _addJobForTest(job: DelegateJob): void {
+  jobs.set(job.id, job);
+}
+
+// ─── Tool definition ──────────────────────────────────────────────────────────
+
 export const delegateToClaudeSubagent: AgentTool = {
   name: "delegate_to_claude_subagent",
   label: "Delegate to Claude Code Subagent",
@@ -233,6 +303,9 @@ export const delegateToClaudeSubagent: AgentTool = {
     prompt: Type.Optional(Type.String({ description: "Task prompt for action=start" })),
     task_label: Type.Optional(Type.String({ description: "Optional short label for trace attribution" })),
     job_id: Type.Optional(Type.String({ description: "Job id for action=status" })),
+    silent: Type.Optional(
+      Type.Boolean({ description: "If true, suppresses Telegram notification on completion" })
+    ),
   }),
   execute: async (_id, params: any) => {
     const action = String(params.action || "").toLowerCase();
@@ -246,7 +319,7 @@ export const delegateToClaudeSubagent: AgentTool = {
         };
       }
 
-      const job = startClaudeDelegation(prompt, params.task_label);
+      const job = startClaudeDelegation(prompt, params.task_label, params.silent ?? false);
       return {
         content: [
           {
@@ -278,7 +351,6 @@ export const delegateToClaudeSubagent: AgentTool = {
         };
       }
 
-      // In-memory first, then fall back to disk (survives restarts)
       const job = jobs.get(jobId) ?? loadJobFromDisk(jobId);
       if (!job) {
         return {
@@ -296,51 +368,36 @@ export const delegateToClaudeSubagent: AgentTool = {
           childSessionId: job.childSessionId,
           parentSessionId: job.parentSessionId,
           taskLabel: job.taskLabel,
-          completed: job.status !== "running",
-          exitCode: job.exitCode,
+          elapsedSec: Math.round(((job.endedAt || Date.now()) - job.startedAt) / 1000),
         },
       };
     }
 
     if (action === "list") {
-      const all = [...jobs.values()].sort((a, b) => b.startedAt - a.startedAt).slice(0, 10);
-      const text = all.length
-        ? all.map((j) => `${j.id} | ${j.status} | ${j.taskLabel}`).join("\n")
-        : "No claude subagent jobs yet.";
+      const allJobs = [...jobs.values()].sort((a, b) => b.startedAt - a.startedAt).slice(0, 20);
+      if (allJobs.length === 0) {
+        return {
+          content: [{ type: "text" as const, text: "No claude subagent jobs yet." }],
+          details: { success: true, count: 0, jobs: [] },
+        };
+      }
+      const lines = allJobs.map((j) => {
+        const elapsedSec = Math.round(((j.endedAt || Date.now()) - j.startedAt) / 1000);
+        return `${j.id} [${j.status}] ${j.taskLabel} (${elapsedSec}s)`;
+      });
       return {
-        content: [{ type: "text" as const, text }],
-        details: { success: true, count: all.length },
+        content: [{ type: "text" as const, text: lines.join("\n") }],
+        details: {
+          success: true,
+          count: allJobs.length,
+          jobs: allJobs.map((j) => ({ id: j.id, status: j.status, taskLabel: j.taskLabel })),
+        },
       };
     }
 
     return {
-      content: [{ type: "text" as const, text: `Invalid action: ${action}. Use start, status, or list.` }],
+      content: [{ type: "text" as const, text: `Invalid action: "${action}". Use start, status, or list` }],
       details: { success: false },
     };
   },
 };
-
-// ─── Test helpers (exported for unit tests only) ──────────────────────────────
-
-export function _buildAnthropicCustomHeadersForTest(input: {
-  childSessionId: string;
-  parentSessionId: string;
-  agentId: string;
-  taskLabel: string;
-  proxyToken?: string;
-}): string {
-  return makeCustomHeaders({
-    "X-AgentWeave-Session-Id": input.childSessionId,
-    "X-AgentWeave-Parent-Session-Id": input.parentSessionId,
-    "X-AgentWeave-Agent-Id": input.agentId,
-    "X-AgentWeave-Agent-Type": "subagent",
-    "X-AgentWeave-Task-Label": input.taskLabel,
-    ...(input.proxyToken ? { "X-AgentWeave-Proxy-Token": input.proxyToken } : {}),
-  });
-}
-
-/** Reset in-memory job store between tests */
-export function _clearJobsForTest(): void {
-  jobs.clear();
-  processes.clear();
-}
