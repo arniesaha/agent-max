@@ -119,8 +119,10 @@ function startClaudeDelegation(prompt: string, taskLabel?: string): DelegateJob 
       : {}),
   };
 
+  const homeBin = `${process.env.HOME || ""}/.local/bin`;
   const childEnv: NodeJS.ProcessEnv = {
     ...process.env,
+    PATH: [homeBin, process.env.PATH || ""].filter(Boolean).join(":"),
     ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL,
     ANTHROPIC_CUSTOM_HEADERS: makeCustomHeaders(attributionHeaders),
     AGENTWEAVE_SESSION_ID: childSessionId,
@@ -144,8 +146,9 @@ function startClaudeDelegation(prompt: string, taskLabel?: string): DelegateJob 
   jobs.set(job.id, job);
   persistJob(job); // write initial "running" state immediately
 
+  const claudeBin = `${process.env.HOME || ""}/.local/bin/claude`;
   const claude = spawn(
-    "claude",
+    claudeBin,
     ["--print", "--permission-mode", "bypassPermissions", "--model", DEFAULT_MODEL, prompt],
     {
       env: childEnv,
