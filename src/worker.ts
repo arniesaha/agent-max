@@ -5,7 +5,7 @@ import { setAgentWeaveSession, resetAgentWeaveSession } from "./agentweave-conte
 import { log } from "./logger.js";
 import { saveSession } from "./session.js";
 
-const AGENTWEAVE_MAX_PROXY = process.env.AGENTWEAVE_PROXY_URL || "http://192.168.1.70:30400";
+const AGENTWEAVE_MAX_PROXY = process.env.AGENTWEAVE_PROXY_URL || "http://arnabsnas.local:30400";
 
 export interface WorkerProgressEvent {
   type: "progress" | "complete" | "error";
