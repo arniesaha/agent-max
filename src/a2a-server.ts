@@ -1,4 +1,5 @@
 import express from "express";
+import { Worker } from "worker_threads";
 import type { Agent } from "@mariozechner/pi-agent-core";
 import type { AgentEvent } from "@mariozechner/pi-agent-core";
 import { createTask, updateTaskStatus, getRecentTasks, getDb } from "./task-journal.js";
@@ -6,12 +7,13 @@ import { setAgentWeaveSession, resetAgentWeaveSession } from "./agentweave-conte
 import { log } from "./logger.js";
 import { saveSession } from "./session.js";
 import { extractAssistantTextFromTurn } from "./response.js";
+import type { WorkerProgressEvent } from "./worker.js";
 
 const A2A_PORT = parseInt(process.env.A2A_PORT || "8770", 10);
 const A2A_SHARED_SECRET = process.env.A2A_SHARED_SECRET || "";
 const startTime = Date.now();
 
-const AGENTWEAVE_MAX_PROXY = process.env.AGENTWEAVE_PROXY_URL || 'http://192.168.1.70:30400';
+const AGENTWEAVE_MAX_PROXY = process.env.AGENTWEAVE_PROXY_URL || "http://192.168.1.70:30400";
 
 const AGENT_CARD = {
   name: "Max",
@@ -42,16 +44,42 @@ function authMiddleware(req: express.Request, res: express.Response, next: expre
   next();
 }
 
+async function relayTaskUpdateToTelegram(taskId: string, message: string): Promise<void> {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const chatIds = (process.env.TELEGRAM_ALLOWED_USERS || "")
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
+
+  if (!token || chatIds.length === 0) return;
+
+  await Promise.all(
+    chatIds.map(async (chatId) => {
+      try {
+        await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            chat_id: chatId,
+            text: `🧵 Task ${taskId}: ${message}`,
+            disable_notification: true,
+          }),
+        });
+      } catch {
+        // best effort
+      }
+    })
+  );
+}
+
 export function createA2AServer(agent: Agent): express.Express {
   const app = express();
   app.use(express.json());
 
-  // Agent Card — public, no auth
   app.get("/.well-known/agent.json", (_req, res) => {
     res.json(AGENT_CARD);
   });
 
-  // Health — public
   app.get("/health", (_req, res) => {
     const uptime = Math.round((Date.now() - startTime) / 1000);
     const recent = getRecentTasks(1);
@@ -64,20 +92,13 @@ export function createA2AServer(agent: Agent): express.Express {
     });
   });
 
-  // A2A Task submission
   app.post("/tasks", authMiddleware, async (req, res) => {
-    if (agent.state.isStreaming) {
-      res.status(409).json({ error: "Agent is busy processing another request" });
-      return;
-    }
-
     let taskId: string | undefined;
 
-    // Extract AgentWeave context from incoming request (set by Nix)
-    const parentSessionId = req.headers['x-agentweave-parent-session-id'] as string | undefined;
-    const delegatedSessionId = req.headers['x-agentweave-delegated-session-id'] as string | undefined;
-    const callerAgentId = req.headers['x-agentweave-agent-id'] as string | undefined;
-    const taskLabel = req.headers['x-agentweave-task-label'] as string | undefined;
+    const parentSessionId = req.headers["x-agentweave-parent-session-id"] as string | undefined;
+    const delegatedSessionId = req.headers["x-agentweave-delegated-session-id"] as string | undefined;
+    const callerAgentId = req.headers["x-agentweave-agent-id"] as string | undefined;
+    const taskLabel = req.headers["x-agentweave-task-label"] as string | undefined;
     const AGENTWEAVE_PROXY_TOKEN = process.env.AGENTWEAVE_PROXY_TOKEN;
 
     try {
@@ -88,37 +109,94 @@ export function createA2AServer(agent: Agent): express.Express {
       }
 
       const text = params.message.parts[0].text;
-      log("info", `A2A task from Nix: ${text.slice(0, 100)}`);
+      const isSync = String(req.query.sync || "false").toLowerCase() === "true";
+      log("info", `A2A task from Nix (${isSync ? "sync" : "async"}): ${text.slice(0, 100)}`);
 
       const task = createTask("a2a_task", "nix", { text, metadata: params.metadata });
       taskId = task.id;
       updateTaskStatus(task.id, "working");
 
-      // Set AgentWeave session context if parent session is provided
+      if (!isSync) {
+        const worker = new Worker(new URL("./worker.js", import.meta.url), {
+          workerData: {
+            taskId: task.id,
+            text,
+            parentSessionId,
+            delegatedSessionId,
+            callerAgentId,
+            taskLabel,
+          },
+        });
+
+        worker.on("message", (event: WorkerProgressEvent) => {
+          if (event.taskId !== task.id) return;
+
+          if (event.type === "progress") {
+            updateTaskStatus(task.id, "working", { progress: event.message || "Working" });
+            if (event.message) {
+              void relayTaskUpdateToTelegram(task.id, event.message);
+            }
+          } else if (event.type === "complete") {
+            updateTaskStatus(task.id, "completed", { response: event.result || "" });
+            void relayTaskUpdateToTelegram(task.id, "Completed");
+            worker.terminate().catch(() => {});
+          } else if (event.type === "error") {
+            updateTaskStatus(task.id, "failed", { error: event.error || "Unknown error" });
+            void relayTaskUpdateToTelegram(task.id, `Failed: ${event.error || "Unknown error"}`);
+            worker.terminate().catch(() => {});
+          }
+        });
+
+        worker.on("error", (err: any) => {
+          log("error", `Worker thread error for task ${task.id}: ${err.message}`);
+          updateTaskStatus(task.id, "failed", { error: err.message });
+        });
+
+        worker.on("exit", (code) => {
+          if (code !== 0) {
+            log("warn", `Worker for task ${task.id} exited with code ${code}`);
+          }
+        });
+
+        res.status(202).json({
+          jsonrpc: "2.0",
+          id: req.body.id,
+          result: {
+            id: task.id,
+            status: { state: "working" },
+          },
+        });
+        return;
+      }
+
+      if (agent.state.isStreaming) {
+        res.status(409).json({ error: "Agent is busy processing another request" });
+        return;
+      }
+
       if (parentSessionId) {
         const sessionId = delegatedSessionId || `max-a2a-${task.id}`;
         try {
           await fetch(`${AGENTWEAVE_MAX_PROXY}/session`, {
-            method: 'POST',
+            method: "POST",
             headers: {
-              'Content-Type': 'application/json',
-              ...(AGENTWEAVE_PROXY_TOKEN ? { 'Authorization': `Bearer ${AGENTWEAVE_PROXY_TOKEN}` } : {}),
+              "Content-Type": "application/json",
+              ...(AGENTWEAVE_PROXY_TOKEN ? { Authorization: `Bearer ${AGENTWEAVE_PROXY_TOKEN}` } : {}),
             },
             body: JSON.stringify({
               session_id: sessionId,
               parent_session_id: parentSessionId,
-              task_label: taskLabel || `a2a from ${callerAgentId || 'nix'}`,
-              agent_type: 'delegated',
+              task_label: taskLabel || `a2a from ${callerAgentId || "nix"}`,
+              agent_type: "delegated",
             }),
           });
-          log('info', `AgentWeave session set: ${sessionId} (parent: ${parentSessionId})`);
+          log("info", `AgentWeave session set: ${sessionId} (parent: ${parentSessionId})`);
           setAgentWeaveSession(sessionId);
         } catch (e: any) {
-          log('warn', `AgentWeave session set failed: ${e.message}`);
+          log("warn", `AgentWeave session set failed: ${e.message}`);
         }
       }
 
-      // Run agent
       let responseText = "";
       const turnStartIndex = agent.state.messages.length;
       const unsub = agent.subscribe((event: AgentEvent) => {
@@ -160,27 +238,25 @@ export function createA2AServer(agent: Agent): express.Express {
         error: { code: -32000, message: e.message },
       });
     } finally {
-      // Restore Max's default session after delegated task completes
-      if (parentSessionId) {
+      if (parentSessionId && String(req.query.sync || "false").toLowerCase() === "true") {
         resetAgentWeaveSession();
         fetch(`${AGENTWEAVE_MAX_PROXY}/session`, {
-          method: 'POST',
+          method: "POST",
           headers: {
-            'Content-Type': 'application/json',
-            ...(AGENTWEAVE_PROXY_TOKEN ? { 'Authorization': `Bearer ${AGENTWEAVE_PROXY_TOKEN}` } : {}),
+            "Content-Type": "application/json",
+            ...(AGENTWEAVE_PROXY_TOKEN ? { Authorization: `Bearer ${AGENTWEAVE_PROXY_TOKEN}` } : {}),
           },
           body: JSON.stringify({
-            session_id: 'max-main',
-            parent_session_id: '',
-            task_label: '',
-            agent_type: 'main',
+            session_id: "max-main",
+            parent_session_id: "",
+            task_label: "",
+            agent_type: "main",
           }),
         }).catch(() => {});
       }
     }
   });
 
-  // Streaming task submission (SSE)
   app.post("/tasks/stream", authMiddleware, async (req, res) => {
     if (agent.state.isStreaming) {
       res.status(409).json({ error: "Agent is busy processing another request" });
@@ -200,7 +276,6 @@ export function createA2AServer(agent: Agent): express.Express {
       const task = createTask("a2a_stream", "tui", { text });
       updateTaskStatus(task.id, "working");
 
-      // SSE headers
       res.writeHead(200, {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
@@ -236,7 +311,6 @@ export function createA2AServer(agent: Agent): express.Express {
             });
             break;
           case "agent_end":
-            // handled after prompt completes
             break;
         }
       });
@@ -259,12 +333,10 @@ export function createA2AServer(agent: Agent): express.Express {
         res.write(`event: error\ndata: ${JSON.stringify({ message: e.message })}\n\n`);
         res.end();
       } catch {
-        // response already closed
       }
     }
   });
 
-  // Messages — returns conversation history
   app.get("/messages", authMiddleware, (_req, res) => {
     const messages = agent.state.messages
       .filter((m: any) => m.role === "user" || m.role === "assistant")
@@ -282,7 +354,6 @@ export function createA2AServer(agent: Agent): express.Express {
     res.json({ messages });
   });
 
-  // Task status query
   app.get("/tasks/:id", authMiddleware, (req, res) => {
     const task = getDb().prepare("SELECT * FROM tasks WHERE id = ?").get(req.params.id);
     if (!task) {
