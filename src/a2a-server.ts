@@ -5,6 +5,7 @@ import { createTask, updateTaskStatus, getRecentTasks, getDb } from "./task-jour
 import { setAgentWeaveSession, resetAgentWeaveSession } from "./agentweave-context.js";
 import { log } from "./logger.js";
 import { saveSession } from "./session.js";
+import { extractAssistantTextFromTurn } from "./response.js";
 
 const A2A_PORT = parseInt(process.env.A2A_PORT || "8770", 10);
 const A2A_SHARED_SECRET = process.env.A2A_SHARED_SECRET || "";
@@ -14,7 +15,7 @@ const AGENTWEAVE_MAX_PROXY = process.env.AGENTWEAVE_PROXY_URL || 'http://192.168
 
 const AGENT_CARD = {
   name: "Max",
-  description: "Local compute and browser agent on Mac Mini",
+  description: "Self-hosted AI agent with browser automation and distributed compute",
   url: process.env.MAX_A2A_URL || `http://localhost:${A2A_PORT}`,
   capabilities: {
     streaming: true,
@@ -119,6 +120,7 @@ export function createA2AServer(agent: Agent): express.Express {
 
       // Run agent
       let responseText = "";
+      const turnStartIndex = agent.state.messages.length;
       const unsub = agent.subscribe((event: AgentEvent) => {
         if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
           responseText += event.assistantMessageEvent.delta;
@@ -129,13 +131,7 @@ export function createA2AServer(agent: Agent): express.Express {
       unsub();
 
       if (!responseText) {
-        const lastMsg = agent.state.messages[agent.state.messages.length - 1];
-        if (lastMsg && "content" in lastMsg && lastMsg.role === "assistant") {
-          responseText = lastMsg.content
-            .filter((c): c is { type: "text"; text: string } => c.type === "text")
-            .map((c) => c.text)
-            .join("");
-        }
+        responseText = extractAssistantTextFromTurn(agent.state.messages as any, turnStartIndex);
       }
 
       updateTaskStatus(task.id, "completed", { response: responseText });
@@ -245,18 +241,12 @@ export function createA2AServer(agent: Agent): express.Express {
         }
       });
 
+      const turnStartIndex = agent.state.messages.length;
       await agent.prompt(text);
       unsub();
 
-      // Extract final response
-      let responseText = "";
-      const lastMsg = agent.state.messages[agent.state.messages.length - 1];
-      if (lastMsg && "content" in lastMsg && lastMsg.role === "assistant") {
-        responseText = lastMsg.content
-          .filter((c): c is { type: "text"; text: string } => c.type === "text")
-          .map((c) => c.text)
-          .join("");
-      }
+      // Extract final response from this turn only
+      const responseText = extractAssistantTextFromTurn(agent.state.messages as any, turnStartIndex);
 
       updateTaskStatus(task.id, "completed", { response: responseText });
       saveSession(agent);

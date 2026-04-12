@@ -6,6 +6,7 @@ import { createTask, updateTaskStatus, getRecentTasks } from "./task-journal.js"
 import { log } from "./logger.js";
 import { traceAgentTurn } from "./tracing.js";
 import { saveSession, clearSession } from "./session.js";
+import { extractAssistantTextFromTurn } from "./response.js";
 
 // ── Deduplication — Issue #2 ─────────────────────────────────────────────────
 const processedUpdateIds = new Set<number>();
@@ -458,6 +459,7 @@ export function createTelegramBot(agent: Agent): Bot {
         }
       });
 
+      const turnStartIndex = agent.state.messages.length;
       startEditing();
       await agent.prompt(text, images);
       unsub();
@@ -467,13 +469,7 @@ export function createTelegramBot(agent: Agent): Bot {
       if (pendingStatusEdit) clearTimeout(pendingStatusEdit);
 
       if (!responseText) {
-        const lastMsg = agent.state.messages[agent.state.messages.length - 1];
-        if (lastMsg && "content" in lastMsg && lastMsg.role === "assistant") {
-          responseText = lastMsg.content
-            .filter((c): c is { type: "text"; text: string } => c.type === "text")
-            .map((c) => c.text)
-            .join("");
-        }
+        responseText = extractAssistantTextFromTurn(agent.state.messages as any, turnStartIndex);
       }
 
       if (!responseText) {
