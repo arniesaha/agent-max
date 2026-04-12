@@ -10,25 +10,19 @@ Agent state (plans, todos, memory) lives in plain markdown files, not structured
 
 Max communicates with companion agents via A2A (Agent-to-Agent) protocol. Users interact through Telegram.
 
-```mermaid
-graph LR
-    User["User<br/>(Telegram)"]
+### 1) System architecture
 
-    subgraph host["Host"]
-        Max["Max Agent<br/>Pi Mono + A2A :8770"]
-    end
+![Agent Max system architecture](docs/diagrams/architecture.png)
 
-    subgraph companion["Companion Agents"]
-        Nix["Nix<br/>A2A :8771"]
-    end
+### 2) A2A task lifecycle (Nix -> Max)
 
-    User <-->|Telegram| Max
-    Max <-->|A2A| Nix
+![A2A task flow](docs/diagrams/a2a-task-flow.png)
 
-    Max -->|CDP| Chrome["Chrome<br/>Browser"]
-    Max -->|WoL / Ollama| GPU["GPU PC"]
-    Max -->|SSH| Remote["Remote Hosts"]
-```
+### 3) Runtime surfaces and execution modes
+
+![Runtime surfaces](docs/diagrams/runtime-surfaces.png)
+
+Source files for all diagrams are in `docs/diagrams/` as both `.excalidraw` and `.png`.
 
 ## Tools
 
