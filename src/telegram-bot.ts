@@ -187,6 +187,7 @@ const TOOL_LABELS: Record<string, string> = {
   launchpad_run_scraper: "🕷️ Running Launchpad scraper",
   launchpad_deploy: "🚢 Deploying Launchpad",
   run_shell: "💻 Running command",
+  delegate_to_claude_subagent: "🤖 Delegating to Claude subagent",
   context_info: "📊 Checking context",
 };
 
