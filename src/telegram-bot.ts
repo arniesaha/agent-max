@@ -6,7 +6,7 @@ import { createTask, updateTaskStatus, getRecentTasks } from "./task-journal.js"
 import { log } from "./logger.js";
 import { traceAgentTurn } from "./tracing.js";
 import { saveSession, clearSession } from "./session.js";
-import { extractAssistantTextFromTurn } from "./response.js";
+import { extractAssistantTextFromTurn, extractErrorFromTurn } from "./response.js";
 
 // ── Deduplication — Issue #2 ─────────────────────────────────────────────────
 const processedUpdateIds = new Set<number>();
@@ -473,12 +473,18 @@ export function createTelegramBot(agent: Agent): Bot {
       }
 
       if (!responseText) {
-        const msgCount = agent.state.messages.length;
-        const lastRole = msgCount > 0 ? (agent.state.messages[msgCount - 1] as any).role : "none";
-        log("warn", `Empty response after prompt. Messages: ${msgCount}, last role: ${lastRole}`);
+        const llmError = extractErrorFromTurn(agent.state.messages as any, turnStartIndex);
+        if (llmError) {
+          log("warn", `LLM error during prompt: ${llmError}`);
+          updateTaskStatus(task.id, "failed", { error: llmError });
+          responseText = `LLM error: ${llmError}`;
+        } else {
+          const msgCount = agent.state.messages.length;
+          const lastRole = msgCount > 0 ? (agent.state.messages[msgCount - 1] as any).role : "none";
+          log("warn", `Empty response after prompt. Messages: ${msgCount}, last role: ${lastRole}`);
+          responseText = "(no response)";
+        }
       }
-
-      responseText = responseText || "(no response)";
 
       // Final edit — finalize the current (possibly split) message
       if (responseText.length <= MAX_MSG_LEN) {

@@ -92,6 +92,17 @@ async function main() {
       }
     }
 
+    // Check for LLM errors (rate limits, timeouts, 500s) surfaced as
+    // AssistantMessage with stopReason: "error" and errorMessage field.
+    if (!responseText) {
+      const lastMsg: any = agent.state.messages[agent.state.messages.length - 1];
+      if (lastMsg?.role === "assistant" && lastMsg.stopReason === "error" && lastMsg.errorMessage) {
+        saveSession(agent);
+        await postProgress({ type: "error", taskId, error: `LLM error: ${lastMsg.errorMessage}` });
+        return;
+      }
+    }
+
     saveSession(agent);
     await postProgress({ type: "complete", taskId, message: "Worker completed", result: responseText });
   } catch (e: any) {

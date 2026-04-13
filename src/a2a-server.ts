@@ -7,7 +7,7 @@ import { createTask, updateTaskStatus, getRecentTasks, getDb } from "./task-jour
 import { setAgentWeaveSession, resetAgentWeaveSession } from "./agentweave-context.js";
 import { log } from "./logger.js";
 import { saveSession } from "./session.js";
-import { extractAssistantTextFromTurn } from "./response.js";
+import { extractAssistantTextFromTurn, extractErrorFromTurn } from "./response.js";
 import type { WorkerProgressEvent } from "./worker.js";
 import { relayTaskUpdateToTelegram, relayJobCompletionToTelegram } from "./telegram-notify.js";
 import { receiveCallback } from "./tools/claude-subagent.js";
@@ -231,22 +231,36 @@ export function createA2AServer(agent: Agent): express.Express {
           responseText = extractAssistantTextFromTurn(agent.state.messages as any, turnStartIndex);
         }
 
-        updateTaskStatus(task.id, "completed", { response: responseText });
+        const llmError = !responseText
+          ? extractErrorFromTurn(agent.state.messages as any, turnStartIndex)
+          : null;
+
         saveSession(agent);
 
-        res.json({
-          jsonrpc: "2.0",
-          id: req.body.id,
-          result: {
-            id: task.id,
-            status: { state: "completed" },
-            artifacts: [
-              {
-                parts: [{ type: "text", text: responseText }],
-              },
-            ],
-          },
-        });
+        if (llmError) {
+          log("warn", `LLM error during A2A sync task ${task.id}: ${llmError}`);
+          updateTaskStatus(task.id, "failed", { error: llmError });
+          res.status(500).json({
+            jsonrpc: "2.0",
+            id: req.body.id,
+            error: { code: -32000, message: `LLM error: ${llmError}` },
+          });
+        } else {
+          updateTaskStatus(task.id, "completed", { response: responseText });
+          res.json({
+            jsonrpc: "2.0",
+            id: req.body.id,
+            result: {
+              id: task.id,
+              status: { state: "completed" },
+              artifacts: [
+                {
+                  parts: [{ type: "text", text: responseText }],
+                },
+              ],
+            },
+          });
+        }
       };
 
       await context.with(incomingContext, executeSyncTask);

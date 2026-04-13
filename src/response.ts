@@ -24,3 +24,26 @@ export function extractAssistantTextFromTurn(messages: AgentMessage[], startInde
 
   return "";
 }
+
+/**
+ * Check if the most recent assistant message in a turn is an LLM error.
+ *
+ * The pi-agent-core framework does NOT throw on LLM errors (rate limits,
+ * timeouts, 500s). Instead it creates an AssistantMessage with
+ * `stopReason: "error"` and an `errorMessage` field.
+ *
+ * Returns the error message string, or null if no error occurred.
+ */
+export function extractErrorFromTurn(messages: AgentMessage[], startIndex: number): string | null {
+  const newMessages = messages.slice(Math.max(0, startIndex));
+
+  for (let i = newMessages.length - 1; i >= 0; i--) {
+    const msg: any = newMessages[i];
+    if (msg?.role !== "assistant") continue;
+    if (msg.stopReason === "error" && msg.errorMessage) {
+      return msg.errorMessage;
+    }
+  }
+
+  return null;
+}
