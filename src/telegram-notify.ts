@@ -33,6 +33,7 @@ export function summarizeResult(text: string, maxChars = 200): string {
  * Used for mid-task progress messages (🧵 prefix).
  */
 export async function relayTaskUpdateToTelegram(taskId: string, message: string): Promise<void> {
+  if (process.env.NODE_ENV === "test") return;
   const token = process.env.TELEGRAM_BOT_TOKEN;
   const chatIds = (process.env.TELEGRAM_ALLOWED_USERS || "")
     .split(",")
@@ -73,6 +74,7 @@ export interface JobCompletionPayload {
  * Used by receiveCallback in claude-subagent.ts and the A2A worker handler.
  */
 export async function relayJobCompletionToTelegram(payload: JobCompletionPayload): Promise<void> {
+  if (process.env.NODE_ENV === "test") return;
   const token = process.env.TELEGRAM_BOT_TOKEN;
   const chatIds = (process.env.TELEGRAM_ALLOWED_USERS || "")
     .split(",")
