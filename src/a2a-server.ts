@@ -1,5 +1,6 @@
 import express from "express";
 import { Worker } from "worker_threads";
+import { context, propagation, trace } from "@opentelemetry/api";
 import type { Agent } from "@mariozechner/pi-agent-core";
 import type { AgentEvent } from "@mariozechner/pi-agent-core";
 import { createTask, updateTaskStatus, getRecentTasks, getDb } from "./task-journal.js";
@@ -76,6 +77,11 @@ export function createA2AServer(agent: Agent): express.Express {
     const taskLabel = req.headers["x-agentweave-task-label"] as string | undefined;
     const AGENTWEAVE_PROXY_TOKEN = process.env.AGENTWEAVE_PROXY_TOKEN;
 
+    // Extract W3C traceparent from incoming request (for Nix → Max delegations).
+    // This creates a new context with the incoming trace parent, which the worker
+    // can use to link its execution as a child span.
+    const incomingContext = propagation.extract(context.active(), req.headers);
+
     try {
       const { params } = req.body;
       if (!params?.message?.parts?.[0]?.text) {
@@ -85,7 +91,7 @@ export function createA2AServer(agent: Agent): express.Express {
 
       const text = params.message.parts[0].text;
       const isSync = String(req.query.sync || "false").toLowerCase() === "true";
-      log("info", `A2A task from Nix (${isSync ? "sync" : "async"}): ${text.slice(0, 100)}`);
+      log("info", `A2A task from ${callerAgentId || "unknown"} (${isSync ? "sync" : "async"}): ${text.slice(0, 100)}`);
 
       const task = createTask("a2a_task", "nix", { text, metadata: params.metadata });
       taskId = task.id;
@@ -95,68 +101,75 @@ export function createA2AServer(agent: Agent): express.Express {
         const workerStartTime = Date.now();
         const isSilent = params.metadata?.silent === true;
 
-        const worker = new Worker(new URL("./worker.js", import.meta.url), {
-          workerData: {
-            taskId: task.id,
-            text,
-            parentSessionId,
-            delegatedSessionId,
-            callerAgentId,
-            taskLabel,
-          },
-        });
+        // Run worker within the extracted context (if present), so the worker's tracer
+        // can create child spans under the incoming trace parent.
+        const executeWorker = async () => {
+          const worker = new Worker(new URL("./worker.js", import.meta.url), {
+            workerData: {
+              taskId: task.id,
+              text,
+              parentSessionId,
+              delegatedSessionId,
+              callerAgentId,
+              taskLabel,
+            },
+          });
 
-        worker.on("message", (event: WorkerProgressEvent) => {
-          if (event.taskId !== task.id) return;
+          worker.on("message", (event: WorkerProgressEvent) => {
+            if (event.taskId !== task.id) return;
 
-          if (event.type === "progress") {
-            updateTaskStatus(task.id, "working", { progress: event.message || "Working" });
-            if (event.message) {
-              void relayTaskUpdateToTelegram(task.id, event.message);
+            if (event.type === "progress") {
+              updateTaskStatus(task.id, "working", { progress: event.message || "Working" });
+              if (event.message) {
+                void relayTaskUpdateToTelegram(task.id, event.message);
+              }
+            } else if (event.type === "complete") {
+              updateTaskStatus(task.id, "completed", { response: event.result || "" });
+              if (!isSilent) {
+                void relayJobCompletionToTelegram({
+                  taskLabel: taskLabel || task.id,
+                  status: "completed",
+                  durationMs: Date.now() - workerStartTime,
+                  result: event.result || "",
+                });
+              }
+              worker.terminate().catch(() => {});
+            } else if (event.type === "error") {
+              updateTaskStatus(task.id, "failed", { error: event.error || "Unknown error" });
+              if (!isSilent) {
+                void relayJobCompletionToTelegram({
+                  taskLabel: taskLabel || task.id,
+                  status: "failed",
+                  durationMs: Date.now() - workerStartTime,
+                  error: event.error || "Unknown error",
+                });
+              }
+              worker.terminate().catch(() => {});
             }
-          } else if (event.type === "complete") {
-            updateTaskStatus(task.id, "completed", { response: event.result || "" });
-            if (!isSilent) {
-              void relayJobCompletionToTelegram({
-                taskLabel: taskLabel || task.id,
-                status: "completed",
-                durationMs: Date.now() - workerStartTime,
-                result: event.result || "",
-              });
-            }
-            worker.terminate().catch(() => {});
-          } else if (event.type === "error") {
-            updateTaskStatus(task.id, "failed", { error: event.error || "Unknown error" });
+          });
+
+          worker.on("error", (err: any) => {
+            log("error", `Worker thread error for task ${task.id}: ${err.message}`);
+            updateTaskStatus(task.id, "failed", { error: err.message });
             if (!isSilent) {
               void relayJobCompletionToTelegram({
                 taskLabel: taskLabel || task.id,
                 status: "failed",
                 durationMs: Date.now() - workerStartTime,
-                error: event.error || "Unknown error",
+                error: err.message,
               });
             }
-            worker.terminate().catch(() => {});
-          }
-        });
+          });
 
-        worker.on("error", (err: any) => {
-          log("error", `Worker thread error for task ${task.id}: ${err.message}`);
-          updateTaskStatus(task.id, "failed", { error: err.message });
-          if (!isSilent) {
-            void relayJobCompletionToTelegram({
-              taskLabel: taskLabel || task.id,
-              status: "failed",
-              durationMs: Date.now() - workerStartTime,
-              error: err.message,
-            });
-          }
-        });
+          worker.on("exit", (code) => {
+            if (code !== 0) {
+              log("warn", `Worker for task ${task.id} exited with code ${code}`);
+            }
+          });
+        };
 
-        worker.on("exit", (code) => {
-          if (code !== 0) {
-            log("warn", `Worker for task ${task.id} exited with code ${code}`);
-          }
-        });
+        // Execute the worker within the incoming trace context (if present)
+        await context.with(incomingContext, executeWorker);
 
         res.status(202).json({
           jsonrpc: "2.0",
@@ -197,37 +210,42 @@ export function createA2AServer(agent: Agent): express.Express {
         }
       }
 
-      let responseText = "";
-      const turnStartIndex = agent.state.messages.length;
-      const unsub = agent.subscribe((event: AgentEvent) => {
-        if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
-          responseText += event.assistantMessageEvent.delta;
+      // Execute sync task within the incoming trace context as well
+      const executeSyncTask = async () => {
+        let responseText = "";
+        const turnStartIndex = agent.state.messages.length;
+        const unsub = agent.subscribe((event: AgentEvent) => {
+          if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+            responseText += event.assistantMessageEvent.delta;
+          }
+        });
+
+        await agent.prompt(text);
+        unsub();
+
+        if (!responseText) {
+          responseText = extractAssistantTextFromTurn(agent.state.messages as any, turnStartIndex);
         }
-      });
 
-      await agent.prompt(text);
-      unsub();
+        updateTaskStatus(task.id, "completed", { response: responseText });
+        saveSession(agent);
 
-      if (!responseText) {
-        responseText = extractAssistantTextFromTurn(agent.state.messages as any, turnStartIndex);
-      }
+        res.json({
+          jsonrpc: "2.0",
+          id: req.body.id,
+          result: {
+            id: task.id,
+            status: { state: "completed" },
+            artifacts: [
+              {
+                parts: [{ type: "text", text: responseText }],
+              },
+            ],
+          },
+        });
+      };
 
-      updateTaskStatus(task.id, "completed", { response: responseText });
-      saveSession(agent);
-
-      res.json({
-        jsonrpc: "2.0",
-        id: req.body.id,
-        result: {
-          id: task.id,
-          status: { state: "completed" },
-          artifacts: [
-            {
-              parts: [{ type: "text", text: responseText }],
-            },
-          ],
-        },
-      });
+      await context.with(incomingContext, executeSyncTask);
     } catch (e: any) {
       agent.abort();
       log("error", `A2A task error: ${e.message}`);
@@ -297,61 +315,27 @@ export function createA2AServer(agent: Agent): express.Express {
             }
             break;
           case "tool_execution_start":
-            sendEvent("tool_start", {
-              toolCallId: event.toolCallId,
-              toolName: event.toolName,
-              args: event.args,
-            });
+            sendEvent("tool_start", { toolName: event.toolName });
             break;
           case "tool_execution_end":
-            sendEvent("tool_end", {
-              toolCallId: event.toolCallId,
-              toolName: event.toolName,
-              isError: event.isError,
-            });
-            break;
-          case "agent_end":
+            sendEvent("tool_end", { toolName: event.toolName });
             break;
         }
       });
 
-      const turnStartIndex = agent.state.messages.length;
       await agent.prompt(text);
       unsub();
-
-      // Extract final response from this turn only
-      const responseText = extractAssistantTextFromTurn(agent.state.messages as any, turnStartIndex);
-
-      updateTaskStatus(task.id, "completed", { response: responseText });
       saveSession(agent);
-      sendEvent("task_end", { taskId: task.id });
+
+      updateTaskStatus(task.id, "completed", { response: "(streamed)" });
+      sendEvent("task_end", { taskId: task.id, status: "completed" });
       res.end();
     } catch (e: any) {
       agent.abort();
       log("error", `A2A stream error: ${e.message}`);
-      try {
-        res.write(`event: error\ndata: ${JSON.stringify({ message: e.message })}\n\n`);
-        res.end();
-      } catch {
-      }
+      res.write(`event: error\ndata: ${JSON.stringify({ error: e.message })}\n\n`);
+      res.end();
     }
-  });
-
-  app.get("/messages", authMiddleware, (_req, res) => {
-    const messages = agent.state.messages
-      .filter((m: any) => m.role === "user" || m.role === "assistant")
-      .map((m: any) => {
-        const text = typeof m.content === "string"
-          ? m.content
-          : Array.isArray(m.content)
-            ? m.content
-                .filter((c: any) => c.type === "text")
-                .map((c: any) => c.text)
-                .join("")
-            : "";
-        return { role: m.role, text };
-      });
-    res.json({ messages });
   });
 
   app.get("/tasks/:id", authMiddleware, (req, res) => {
@@ -362,7 +346,6 @@ export function createA2AServer(agent: Agent): express.Express {
     }
     res.json(task);
   });
-
 
   /**
    * POST /tasks/callback
