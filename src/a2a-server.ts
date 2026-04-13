@@ -8,6 +8,8 @@ import { log } from "./logger.js";
 import { saveSession } from "./session.js";
 import { extractAssistantTextFromTurn } from "./response.js";
 import type { WorkerProgressEvent } from "./worker.js";
+import { relayTaskUpdateToTelegram, relayJobCompletionToTelegram } from "./telegram-notify.js";
+import { receiveCallback } from "./tools/claude-subagent.js";
 
 const A2A_PORT = parseInt(process.env.A2A_PORT || "8770", 10);
 const A2A_SHARED_SECRET = process.env.A2A_SHARED_SECRET || "";
@@ -22,6 +24,7 @@ const AGENT_CARD = {
   capabilities: {
     streaming: true,
     async_tasks: true,
+    callback_endpoint: true,
   },
   skills: [
     "browser_control",
@@ -42,34 +45,6 @@ function authMiddleware(req: express.Request, res: express.Response, next: expre
     return;
   }
   next();
-}
-
-async function relayTaskUpdateToTelegram(taskId: string, message: string): Promise<void> {
-  const token = process.env.TELEGRAM_BOT_TOKEN;
-  const chatIds = (process.env.TELEGRAM_ALLOWED_USERS || "")
-    .split(",")
-    .map((x) => x.trim())
-    .filter(Boolean);
-
-  if (!token || chatIds.length === 0) return;
-
-  await Promise.all(
-    chatIds.map(async (chatId) => {
-      try {
-        await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            chat_id: chatId,
-            text: `🧵 Task ${taskId}: ${message}`,
-            disable_notification: true,
-          }),
-        });
-      } catch {
-        // best effort
-      }
-    })
-  );
 }
 
 export function createA2AServer(agent: Agent): express.Express {
@@ -117,6 +92,9 @@ export function createA2AServer(agent: Agent): express.Express {
       updateTaskStatus(task.id, "working");
 
       if (!isSync) {
+        const workerStartTime = Date.now();
+        const isSilent = params.metadata?.silent === true;
+
         const worker = new Worker(new URL("./worker.js", import.meta.url), {
           workerData: {
             taskId: task.id,
@@ -138,11 +116,25 @@ export function createA2AServer(agent: Agent): express.Express {
             }
           } else if (event.type === "complete") {
             updateTaskStatus(task.id, "completed", { response: event.result || "" });
-            void relayTaskUpdateToTelegram(task.id, "Completed");
+            if (!isSilent) {
+              void relayJobCompletionToTelegram({
+                taskLabel: taskLabel || task.id,
+                status: "completed",
+                durationMs: Date.now() - workerStartTime,
+                result: event.result || "",
+              });
+            }
             worker.terminate().catch(() => {});
           } else if (event.type === "error") {
             updateTaskStatus(task.id, "failed", { error: event.error || "Unknown error" });
-            void relayTaskUpdateToTelegram(task.id, `Failed: ${event.error || "Unknown error"}`);
+            if (!isSilent) {
+              void relayJobCompletionToTelegram({
+                taskLabel: taskLabel || task.id,
+                status: "failed",
+                durationMs: Date.now() - workerStartTime,
+                error: event.error || "Unknown error",
+              });
+            }
             worker.terminate().catch(() => {});
           }
         });
@@ -150,6 +142,14 @@ export function createA2AServer(agent: Agent): express.Express {
         worker.on("error", (err: any) => {
           log("error", `Worker thread error for task ${task.id}: ${err.message}`);
           updateTaskStatus(task.id, "failed", { error: err.message });
+          if (!isSilent) {
+            void relayJobCompletionToTelegram({
+              taskLabel: taskLabel || task.id,
+              status: "failed",
+              durationMs: Date.now() - workerStartTime,
+              error: err.message,
+            });
+          }
         });
 
         worker.on("exit", (code) => {
@@ -361,6 +361,49 @@ export function createA2AServer(agent: Agent): express.Express {
       return;
     }
     res.json(task);
+  });
+
+
+  /**
+   * POST /tasks/callback
+   * Called by Nix (or any external agent) when an async subagent job completes.
+   * Body: { jobId: string, status: 'completed' | 'failed' | 'timed_out', result?: string, error?: string }
+   */
+  app.post("/tasks/callback", authMiddleware, (req, res) => {
+    const { jobId, status, result, error } = req.body as {
+      jobId?: string;
+      status?: string;
+      result?: string;
+      error?: string;
+    };
+
+    if (!jobId || typeof jobId !== "string") {
+      res.status(400).json({ error: "Missing or invalid jobId" });
+      return;
+    }
+
+    const validStatuses = ["completed", "failed", "timed_out"] as const;
+    type CallbackStatus = (typeof validStatuses)[number];
+    if (!status || !validStatuses.includes(status as CallbackStatus)) {
+      res.status(400).json({ error: `Invalid status. Must be one of: ${validStatuses.join(", ")}` });
+      return;
+    }
+
+    let found = false;
+    try {
+      found = receiveCallback(jobId, status as CallbackStatus, result, error);
+    } catch (e: any) {
+      log("error", `POST /tasks/callback error for job ${jobId}: ${e.message}`);
+      res.status(500).json({ error: "Internal error processing callback" });
+      return;
+    }
+
+    if (!found) {
+      res.status(404).json({ error: `Unknown jobId: ${jobId}` });
+      return;
+    }
+
+    res.status(200).json({ ok: true, jobId, status });
   });
 
   return app;

@@ -99,3 +99,43 @@ describe("Telegram relay message format", () => {
     );
   });
 });
+
+// ─── Silent flag — DelegateJob.silent field ───────────────────────────────────
+
+import { _clearJobsForTest, _addJobForTest } from "../src/tools/claude-subagent.js";
+
+describe("DelegateJob silent flag", () => {
+  it("silent=true is preserved in job object", () => {
+    _clearJobsForTest();
+    const job = {
+      id: "silent-job-test",
+      taskLabel: "silent task",
+      prompt: "do something quietly",
+      childSessionId: "c1",
+      parentSessionId: "p1",
+      startedAt: Date.now() - 1000,
+      status: "running" as const,
+      output: "",
+      silent: true,
+    };
+    _addJobForTest(job);
+    expect(job.silent).toBe(true);
+  });
+
+  it("silent=false is preserved in job object", () => {
+    _clearJobsForTest();
+    const job = {
+      id: "noisy-job-test",
+      taskLabel: "noisy task",
+      prompt: "do something loudly",
+      childSessionId: "c2",
+      parentSessionId: "p2",
+      startedAt: Date.now() - 1000,
+      status: "running" as const,
+      output: "",
+      silent: false,
+    };
+    _addJobForTest(job);
+    expect(job.silent).toBe(false);
+  });
+});
