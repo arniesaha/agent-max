@@ -29,6 +29,7 @@ jest.unstable_mockModule("../src/agentweave-context.js", () => ({
 }));
 jest.unstable_mockModule("../src/response.js", () => ({
   extractAssistantTextFromTurn: jest.fn().mockReturnValue(""),
+  extractErrorFromTurn: jest.fn().mockReturnValue(null),
 }));
 jest.unstable_mockModule("../src/telegram-notify.js", () => ({
   relayTaskUpdateToTelegram: jest.fn(),
