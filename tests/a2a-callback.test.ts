@@ -5,7 +5,7 @@ import { describe, it, expect, jest } from "@jest/globals";
  * Tests the HTTP layer: auth gating, input validation, and routing.
  */
 
-jest.mock("../src/task-journal.js", () => ({
+jest.unstable_mockModule("../src/task-journal.js", () => ({
   createTask: jest.fn().mockReturnValue({ id: "task-001", status: "working" }),
   updateTaskStatus: jest.fn(),
   getRecentTasks: jest.fn().mockReturnValue([]),
@@ -17,26 +17,26 @@ jest.mock("../src/task-journal.js", () => ({
   }),
 }));
 
-jest.mock("../src/logger.js", () => ({ log: jest.fn() }));
-jest.mock("../src/session.js", () => ({
+jest.unstable_mockModule("../src/logger.js", () => ({ log: jest.fn() }));
+jest.unstable_mockModule("../src/session.js", () => ({
   saveSession: jest.fn(),
   loadSession: jest.fn().mockReturnValue(null),
 }));
-jest.mock("../src/agentweave-context.js", () => ({
+jest.unstable_mockModule("../src/agentweave-context.js", () => ({
   setAgentWeaveSession: jest.fn(),
   resetAgentWeaveSession: jest.fn(),
   getAgentWeaveSession: jest.fn().mockReturnValue("max-main"),
 }));
-jest.mock("../src/response.js", () => ({
+jest.unstable_mockModule("../src/response.js", () => ({
   extractAssistantTextFromTurn: jest.fn().mockReturnValue(""),
 }));
-jest.mock("../src/telegram-notify.js", () => ({
+jest.unstable_mockModule("../src/telegram-notify.js", () => ({
   relayTaskUpdateToTelegram: jest.fn(),
   relayJobCompletionToTelegram: jest.fn(),
   formatDuration: jest.fn().mockReturnValue("1s"),
   summarizeResult: jest.fn().mockImplementation((t: unknown) => t as string),
 }));
-jest.mock("../src/tools/claude-subagent.js", () => ({
+jest.unstable_mockModule("../src/tools/claude-subagent.js", () => ({
   receiveCallback: jest.fn(),
   delegateToClaudeSubagent: {},
   _clearJobsForTest: jest.fn(),
@@ -45,7 +45,7 @@ jest.mock("../src/tools/claude-subagent.js", () => ({
   truncateOutput: jest.fn().mockImplementation((t: unknown) => t),
   MAX_OUTPUT_CHARS: 15000,
 }));
-jest.mock("worker_threads", () => ({
+jest.unstable_mockModule("worker_threads", () => ({
   Worker: jest.fn().mockImplementation(() => ({ on: jest.fn(), terminate: jest.fn() })),
 }));
 
@@ -54,7 +54,7 @@ process.env.A2A_SHARED_SECRET = SECRET;
 
 const { createA2AServer } = await import("../src/a2a-server.js");
 const { receiveCallback } = await import("../src/tools/claude-subagent.js");
-const { _addJobForTest, _clearJobsForTest } = await import("../src/tools/claude-subagent.js");
+const receiveCallbackMock = receiveCallback as jest.Mock;
 
 function makeAgent() {
   return {
@@ -131,19 +131,7 @@ describe("POST /tasks/callback — HTTP layer", () => {
   });
 
   it("accepts timed_out as a valid status", async () => {
-    // Pre-load a job so receiveCallback returns true
-    _clearJobsForTest();
-    _addJobForTest({
-      id: "timed-out-job",
-      taskLabel: "test",
-      prompt: "test",
-      childSessionId: "c",
-      parentSessionId: "p",
-      startedAt: Date.now() - 5000,
-      status: "running" as const,
-      output: "",
-      silent: true,
-    });
+    receiveCallbackMock.mockReturnValueOnce(true);
     const app = createA2AServer(makeAgent());
     const res = await callEndpoint(app, "POST", "/tasks/callback", {
       auth: `Bearer ${SECRET}`,
@@ -154,18 +142,7 @@ describe("POST /tasks/callback — HTTP layer", () => {
   });
 
   it("returns 200 with ok=true for a known job", async () => {
-    _clearJobsForTest();
-    _addJobForTest({
-      id: "known-job-001",
-      taskLabel: "test job",
-      prompt: "test",
-      childSessionId: "c",
-      parentSessionId: "p",
-      startedAt: Date.now() - 1000,
-      status: "running" as const,
-      output: "",
-      silent: true,
-    });
+    receiveCallbackMock.mockReturnValueOnce(true);
     const app = createA2AServer(makeAgent());
     const res = await callEndpoint(app, "POST", "/tasks/callback", {
       auth: `Bearer ${SECRET}`,
@@ -177,7 +154,7 @@ describe("POST /tasks/callback — HTTP layer", () => {
   });
 
   it("returns 404 for unknown jobId", async () => {
-    _clearJobsForTest();
+    receiveCallbackMock.mockReturnValueOnce(false);
     const app = createA2AServer(makeAgent());
     const res = await callEndpoint(app, "POST", "/tasks/callback", {
       auth: `Bearer ${SECRET}`,

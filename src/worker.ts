@@ -1,4 +1,5 @@
 import { parentPort, workerData } from "worker_threads";
+import { context, propagation } from "@opentelemetry/api";
 import type { AgentEvent } from "@mariozechner/pi-agent-core";
 import { createAgent } from "./agent.js";
 import { setAgentWeaveSession, resetAgentWeaveSession } from "./agentweave-context.js";
@@ -22,6 +23,8 @@ interface WorkerTaskData {
   delegatedSessionId?: string;
   callerAgentId?: string;
   taskLabel?: string;
+  /** Serialized W3C trace headers (e.g. traceparent) from the calling agent. */
+  traceHeaders?: Record<string, string>;
 }
 
 async function postProgress(event: WorkerProgressEvent): Promise<void> {
@@ -29,9 +32,16 @@ async function postProgress(event: WorkerProgressEvent): Promise<void> {
 }
 
 async function main() {
-  const { taskId, text, parentSessionId, delegatedSessionId, callerAgentId, taskLabel } = workerData as WorkerTaskData;
+  const { taskId, text, parentSessionId, delegatedSessionId, callerAgentId, taskLabel, traceHeaders } = workerData as WorkerTaskData;
+
+  // Re-extract trace context from serialized headers so this worker's spans
+  // are linked as children of the calling agent's trace.
+  const incomingContext = traceHeaders
+    ? propagation.extract(context.active(), traceHeaders)
+    : context.active();
   const AGENTWEAVE_PROXY_TOKEN = process.env.AGENTWEAVE_PROXY_TOKEN;
 
+  await context.with(incomingContext, async () => {
   try {
     await postProgress({ type: "progress", taskId, message: "Worker started" });
 
@@ -105,6 +115,7 @@ async function main() {
       }).catch(() => {});
     }
   }
+  }); // end context.with
 }
 
 void main();
