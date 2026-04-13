@@ -1,6 +1,6 @@
 import express from "express";
 import { Worker } from "worker_threads";
-import { context, propagation, trace } from "@opentelemetry/api";
+import { context, propagation } from "@opentelemetry/api";
 import type { Agent } from "@mariozechner/pi-agent-core";
 import type { AgentEvent } from "@mariozechner/pi-agent-core";
 import { createTask, updateTaskStatus, getRecentTasks, getDb } from "./task-journal.js";
@@ -78,9 +78,12 @@ export function createA2AServer(agent: Agent): express.Express {
     const AGENTWEAVE_PROXY_TOKEN = process.env.AGENTWEAVE_PROXY_TOKEN;
 
     // Extract W3C traceparent from incoming request (for Nix → Max delegations).
-    // This creates a new context with the incoming trace parent, which the worker
-    // can use to link its execution as a child span.
+    // Workers run in a separate thread — AsyncLocalStorage context doesn't cross
+    // thread boundaries. So we (a) run parent-thread work in this context, AND
+    // (b) serialize the traceparent headers into workerData for the worker to re-extract.
     const incomingContext = propagation.extract(context.active(), req.headers);
+    const traceHeaders: Record<string, string> = {};
+    propagation.inject(incomingContext, traceHeaders);
 
     try {
       const { params } = req.body;
@@ -112,6 +115,7 @@ export function createA2AServer(agent: Agent): express.Express {
               delegatedSessionId,
               callerAgentId,
               taskLabel,
+              traceHeaders,
             },
           });
 
