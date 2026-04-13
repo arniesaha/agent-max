@@ -15,7 +15,7 @@ import { propagation, context } from "@opentelemetry/api";
  * focus on the serialisation/deserialisation round-trip and HTTP contract.
  */
 
-jest.mock("../src/task-journal.js", () => ({
+jest.unstable_mockModule("../src/task-journal.js", () => ({
   createTask: jest.fn().mockReturnValue({ id: "task-001", status: "working" }),
   updateTaskStatus: jest.fn(),
   getRecentTasks: jest.fn().mockReturnValue([]),
@@ -26,28 +26,28 @@ jest.mock("../src/task-journal.js", () => ({
     }),
   }),
 }));
-jest.mock("../src/logger.js", () => ({ log: jest.fn() }));
-jest.mock("../src/session.js", () => ({
+jest.unstable_mockModule("../src/logger.js", () => ({ log: jest.fn() }));
+jest.unstable_mockModule("../src/session.js", () => ({
   saveSession: jest.fn(),
   loadSession: jest.fn().mockReturnValue(null),
 }));
-jest.mock("../src/agentweave-context.js", () => ({
+jest.unstable_mockModule("../src/agentweave-context.js", () => ({
   setAgentWeaveSession: jest.fn(),
   resetAgentWeaveSession: jest.fn(),
   getAgentWeaveSession: jest.fn().mockReturnValue("max-main"),
 }));
-jest.mock("../src/response.js", () => ({
+jest.unstable_mockModule("../src/response.js", () => ({
   extractAssistantTextFromTurn: jest.fn().mockReturnValue(""),
 }));
-jest.mock("../src/telegram-notify.js", () => ({
+jest.unstable_mockModule("../src/telegram-notify.js", () => ({
   relayTaskUpdateToTelegram: jest.fn(),
   relayJobCompletionToTelegram: jest.fn(),
 }));
-jest.mock("../src/tools/claude-subagent.js", () => ({
+jest.unstable_mockModule("../src/tools/claude-subagent.js", () => ({
   receiveCallback: jest.fn(),
   delegateToClaudeSubagent: {},
 }));
-jest.mock("worker_threads", () => ({
+jest.unstable_mockModule("worker_threads", () => ({
   Worker: jest.fn().mockImplementation(() => ({ on: jest.fn(), terminate: jest.fn() })),
 }));
 
