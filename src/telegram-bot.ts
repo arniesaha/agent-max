@@ -168,6 +168,16 @@ async function replyWithFormat(ctx: Context, text: string): Promise<void> {
   }
 }
 
+async function sendWithFormat(bot: Bot, chatId: number, text: string): Promise<number> {
+  try {
+    const msg = await bot.api.sendMessage(chatId, mdToHtml(text), { parse_mode: "HTML" });
+    return msg.message_id;
+  } catch {
+    const msg = await bot.api.sendMessage(chatId, text);
+    return msg.message_id;
+  }
+}
+
 const TOOL_LABELS: Record<string, string> = {
   delegate_to_nix: "🔗 Asking Nix",
   wake_gpu: "⚡ Waking GPU",
@@ -349,24 +359,20 @@ export function createTelegramBot(agent: Agent): Bot {
         if (responseText.length > 0) {
           // Streaming text — check if we need to split into a new message
           if (responseText.length > MAX_MSG_LEN) {
-            // Find a good split point
-            let splitAt = responseText.lastIndexOf("\n", MAX_MSG_LEN);
-            if (splitAt < MAX_MSG_LEN / 2) splitAt = MAX_MSG_LEN;
+            // Find a natural split point: paragraph > sentence > word
+            const splitAt = findSplitPoint(responseText, MAX_MSG_LEN);
             const chunk = responseText.slice(0, splitAt);
-            const remainder = responseText.slice(splitAt);
+            const remainder = responseText.slice(splitAt).trimStart();
 
             // Finalize current message with the chunk (no cursor)
-            try {
-              await bot.api.editMessageText(chatId, currentMsgId, mdToHtml(chunk), { parse_mode: "HTML" });
-            } catch {
-              try { await bot.api.editMessageText(chatId, currentMsgId, chunk); } catch {}
-            }
+            await editWithFormat(bot, chatId, currentMsgId, chunk);
             allChunks.push(chunk);
 
-            // Send a new message for the remainder
+            // Send a new message for the remainder — small delay for ordering
             try {
-              const newMsg = await bot.api.sendMessage(chatId, remainder + " ▍");
-              currentMsgId = newMsg.message_id;
+              await new Promise(r => setTimeout(r, 200));
+              const newMsgId = await sendWithFormat(bot, chatId, remainder + " ▍");
+              currentMsgId = newMsgId;
               responseText = remainder;
               lastEditedText = remainder;
             } catch (e: any) {
@@ -596,6 +602,35 @@ export function createTelegramBot(agent: Agent): Bot {
   return bot;
 }
 
+/**
+ * Find the best split point in text at or before maxLen.
+ * Priority: double-newline (paragraph) > single newline > sentence end > word boundary > hard cut.
+ */
+function findSplitPoint(text: string, maxLen: number): number {
+  if (text.length <= maxLen) return text.length;
+
+  // 1. Paragraph boundary: double newline
+  let idx = text.lastIndexOf("\n\n", maxLen);
+  if (idx > maxLen / 2) return idx + 2; // include the newlines in the first chunk
+
+  // 2. Single newline
+  idx = text.lastIndexOf("\n", maxLen);
+  if (idx > maxLen / 2) return idx + 1;
+
+  // 3. Sentence boundary: ". ", "! ", "? "
+  const sentenceMatch = text.slice(0, maxLen).match(/^.*[.!?]\s/s);
+  if (sentenceMatch && sentenceMatch[0].length > maxLen / 2) {
+    return sentenceMatch[0].length;
+  }
+
+  // 4. Word boundary: last space
+  idx = text.lastIndexOf(" ", maxLen);
+  if (idx > maxLen / 2) return idx + 1;
+
+  // 5. Hard cut at maxLen
+  return maxLen;
+}
+
 function splitMessage(text: string, maxLen: number): string[] {
   if (text.length <= maxLen) return [text];
   const chunks: string[] = [];
@@ -605,10 +640,9 @@ function splitMessage(text: string, maxLen: number): string[] {
       chunks.push(remaining);
       break;
     }
-    let splitAt = remaining.lastIndexOf("\n", maxLen);
-    if (splitAt < maxLen / 2) splitAt = maxLen;
+    const splitAt = findSplitPoint(remaining, maxLen);
     chunks.push(remaining.slice(0, splitAt));
-    remaining = remaining.slice(splitAt);
+    remaining = remaining.slice(splitAt).trimStart();
   }
   return chunks;
 }
