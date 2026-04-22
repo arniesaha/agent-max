@@ -3,11 +3,37 @@ import type { AssistantMessage, Message } from "@mariozechner/pi-ai";
 import { getModel, getEnvApiKey, streamSimple } from "@mariozechner/pi-ai";
 import { log } from "./logger.js";
 
-const CONTEXT_WINDOW = 1_000_000;
-const COMPACT_THRESHOLD = 0.8; // compact at 80%
+/**
+ * Context-sizing knobs.
+ *
+ * Defaults target a Claude subscription path, where every input token counts
+ * against the 5-hour rate limit — compact at ~150K before a long session can
+ * exhaust quota.
+ *
+ * Override via env for providers with cheaper long context (e.g. Gemini direct):
+ *   MAX_CONTEXT_WINDOW=1000000 MAX_COMPACT_THRESHOLD=0.8 MAX_KEEP_RECENT=6
+ */
+function envNumber(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+const CONTEXT_WINDOW = envNumber("MAX_CONTEXT_WINDOW", 200_000);
+const COMPACT_THRESHOLD = envNumber("MAX_COMPACT_THRESHOLD", 0.75);
 const TOKEN_LIMIT = Math.floor(CONTEXT_WINDOW * COMPACT_THRESHOLD);
-// Keep at least the last N messages untouched during compaction
-const KEEP_RECENT = 6;
+const KEEP_RECENT = Math.floor(envNumber("MAX_KEEP_RECENT", 6));
+
+let loggedConfig = false;
+function logConfigOnce(): void {
+  if (loggedConfig) return;
+  loggedConfig = true;
+  log(
+    "info",
+    `Context sizing: window=${CONTEXT_WINDOW} threshold=${TOKEN_LIMIT} (${Math.round(COMPACT_THRESHOLD * 100)}%) keepRecent=${KEEP_RECENT}`
+  );
+}
 
 /** Rough token estimate: ~4 chars per token for text, actual usage for assistant messages */
 function estimateMessageTokens(msg: AgentMessage): number {
@@ -77,6 +103,7 @@ export function getContextStats(messages: AgentMessage[]): ContextStats {
  * - Replace with a single compact user message containing the summary
  */
 export async function transformContext(messages: AgentMessage[]): Promise<AgentMessage[]> {
+  logConfigOnce();
   const totalTokens = messages.reduce((sum, m) => sum + estimateMessageTokens(m), 0);
 
   if (totalTokens <= TOKEN_LIMIT) {
