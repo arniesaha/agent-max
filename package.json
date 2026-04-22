@@ -9,7 +9,8 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "nodemon --exec tsx src/index.ts",
-    "tui": "tsx src/tui.ts"
+    "tui": "tsx src/tui.ts",
+    "ctx-ignore": "ctx-ignore scan ."
   },
   "bin": {
     "max-tui": "dist/tui.js"
@@ -26,6 +27,7 @@
     "dotenv": "latest",
     "express": "latest",
     "grammy": "latest",
+    "ignore": "^7.0.5",
     "ws": "^8.19.0"
   },
   "devDependencies": {

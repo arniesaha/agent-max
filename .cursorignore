@@ -1,0 +1,9 @@
+package-lock.json
+node_modules/
+dist/
+*.png
+data/
+logs/
+*.db
+*.db-journal
+.env

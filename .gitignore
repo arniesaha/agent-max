@@ -8,3 +8,7 @@ logs/
 .claude/
 REQUIREMENTS.md
 TODO.md
+
+# ctx-ignore: added by ctx-ignore scan
+# (lockfiles and tests intentionally excluded — they belong in git, ignored only for AI context)
+*.png
