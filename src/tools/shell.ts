@@ -2,6 +2,7 @@ import { Type } from "@mariozechner/pi-ai";
 import type { AgentTool } from "@mariozechner/pi-agent-core";
 import { exec } from "child_process";
 import { promisify } from "util";
+import { headAndTail } from "./truncate.js";
 
 const execAsync = promisify(exec);
 
@@ -31,11 +32,11 @@ export const runShell: AgentTool = {
       });
 
       const output = [stdout, stderr].filter(Boolean).join("\n").trim();
-      const truncated = output.length > MAX_OUTPUT ? output.slice(0, MAX_OUTPUT) + "\n...(truncated)" : output;
+      const truncated = headAndTail(output, MAX_OUTPUT);
       return { content: [{ type: "text", text: truncated || "(no output)" }], details: { success: true } };
     } catch (e: any) {
       const output = [e.stdout || "", e.stderr || ""].filter(Boolean).join("\n").trim();
-      const truncated = output.length > MAX_OUTPUT ? output.slice(0, MAX_OUTPUT) + "\n...(truncated)" : output;
+      const truncated = headAndTail(output, MAX_OUTPUT);
       return {
         content: [{ type: "text", text: `Command failed (exit ${e.code}): ${truncated || e.message}` }],
         details: { success: false, exitCode: e.code, error: e.message },

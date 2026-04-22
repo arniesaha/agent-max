@@ -35,6 +35,13 @@ function logConfigOnce(): void {
   );
 }
 
+// How many user turns at the tail to keep tool-result bodies intact.
+// Older toolResults beyond this window are replaced with a 1-line stub.
+// This is the biggest in-session lever: a single gh-diff or browser-scrape
+// otherwise re-bills itself on every subsequent agent iteration.
+const FRESH_TURNS = Math.floor(Number(process.env.MAX_FRESH_TURNS || 4));
+const STALE_STUB_CHARS = 200; // keep a tiny prefix for continuity
+
 /** Rough token estimate: ~4 chars per token for text, actual usage for assistant messages */
 function estimateMessageTokens(msg: AgentMessage): number {
   const m = msg as Message;
@@ -102,8 +109,69 @@ export function getContextStats(messages: AgentMessage[]): ContextStats {
  * - Extract key information: tool calls made, results, decisions, errors
  * - Replace with a single compact user message containing the summary
  */
+/**
+ * Replace tool-result bodies older than the last `FRESH_TURNS` user turns with
+ * a short stub. The result preserves the message structure (role, toolCallId,
+ * isError) so tool_use ↔ tool_result pairing remains valid, but strips the
+ * bulk of text content that would otherwise be re-sent to the model on every
+ * subsequent iteration within the same session.
+ *
+ * Idempotent: a message whose content is already the stub marker is left alone.
+ */
+export function pruneStaleToolResults(
+  messages: AgentMessage[],
+  freshTurns = FRESH_TURNS
+): AgentMessage[] {
+  if (freshTurns <= 0 || messages.length === 0) return messages;
+
+  // Identify the cut index: the index of the (freshTurns)th user message from the end.
+  let seen = 0;
+  let cutIdx = 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if ((messages[i] as Message).role === "user") {
+      seen++;
+      if (seen === freshTurns) {
+        cutIdx = i;
+        break;
+      }
+    }
+  }
+  if (cutIdx <= 0) return messages; // nothing stale
+
+  let changed = false;
+  const out = messages.map((msg, idx) => {
+    if (idx >= cutIdx) return msg;
+    const m = msg as any;
+    if (m.role !== "toolResult") return msg;
+    if (!Array.isArray(m.content)) return msg;
+
+    // Compute total text length; if already tiny, leave alone.
+    let totalLen = 0;
+    for (const c of m.content) {
+      if (c.type === "text" && typeof c.text === "string") totalLen += c.text.length;
+    }
+    if (totalLen <= STALE_STUB_CHARS * 2) return msg; // already small
+
+    const name = m.toolName || "tool";
+    // Keep a short head prefix of the first text block (often contains path /
+    // status / counts) to preserve a breadcrumb for the model.
+    const firstText = m.content.find((c: any) => c.type === "text")?.text ?? "";
+    const head = firstText.slice(0, STALE_STUB_CHARS).replace(/\s+/g, " ").trim();
+    const stubText = `[${name} result — body pruned from context (${totalLen} chars). head: ${head}${head.length < firstText.length ? "…" : ""}]`;
+    changed = true;
+    return { ...m, content: [{ type: "text", text: stubText }] };
+  });
+
+  return changed ? out : messages;
+}
+
 export async function transformContext(messages: AgentMessage[]): Promise<AgentMessage[]> {
   logConfigOnce();
+
+  // Cheap in-session pruning first — runs every turn, strips old toolResult
+  // bodies so a long merge/debug session doesn't re-bill huge diffs forever.
+  messages = pruneStaleToolResults(messages);
+
   const totalTokens = messages.reduce((sum, m) => sum + estimateMessageTokens(m), 0);
 
   if (totalTokens <= TOKEN_LIMIT) {

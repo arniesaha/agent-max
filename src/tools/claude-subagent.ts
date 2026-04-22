@@ -6,6 +6,7 @@ import { join } from "path";
 import { log } from "../logger.js";
 import { getAgentWeaveSession } from "../agentweave-context.js";
 import { relayJobCompletionToTelegram } from "../telegram-notify.js";
+import { headAndTail } from "./truncate.js";
 
 type DelegateJobStatus = "running" | "completed" | "failed" | "timed_out";
 
@@ -82,9 +83,8 @@ export function evictOldJobs(): void {
 }
 
 export function truncateOutput(text: string): string {
-  if (text.length <= MAX_OUTPUT_CHARS) return text;
-  // Keep the tail — most recent output is most useful
-  return text.slice(text.length - MAX_OUTPUT_CHARS);
+  // Keep head (initial plan/progress) and tail (final answer/errors).
+  return headAndTail(text, MAX_OUTPUT_CHARS);
 }
 
 function makeCustomHeaders(headers: Record<string, string>): string {

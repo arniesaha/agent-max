@@ -12,12 +12,18 @@ function resolvePath(p: string): string {
   return path.join(MAX_HOME, p);
 }
 
+const MAX_READ_CHARS = 20_000;
+const DEFAULT_LIMIT_LINES = 500;
+
 export const readFileTool: AgentTool = {
   name: "read_file",
   label: "Read File",
-  description: "Read the contents of a file. Paths are relative to ~/max/ by default.",
+  description:
+    "Read the contents of a file. Paths are relative to ~/max/ by default. Large files are paginated: default returns the first 500 lines (capped at ~20K chars). Use `offset` + `limit` to page through larger files.",
   parameters: Type.Object({
     path: Type.String({ description: "File path (relative to ~/max/ or absolute)" }),
+    offset: Type.Optional(Type.Number({ description: "Starting line (0-indexed). Default: 0" })),
+    limit: Type.Optional(Type.Number({ description: "Max lines to return. Default: 500" })),
   }),
   execute: async (_id, params: any) => {
     try {
@@ -28,8 +34,34 @@ export const readFileTool: AgentTool = {
           details: { path: resolved, ignored: true },
         };
       }
-      const content = await readFile(resolved, "utf-8");
-      return { content: [{ type: "text", text: content }], details: { path: resolved, size: content.length } };
+      const offset = Math.max(0, Math.floor(params.offset ?? 0));
+      const limit = Math.max(1, Math.floor(params.limit ?? DEFAULT_LIMIT_LINES));
+
+      const full = await readFile(resolved, "utf-8");
+      const allLines = full.split("\n");
+      const totalLines = allLines.length;
+      const slice = allLines.slice(offset, offset + limit);
+      let text = slice.join("\n");
+      let charTruncated = false;
+      if (text.length > MAX_READ_CHARS) {
+        text = text.slice(0, MAX_READ_CHARS);
+        charTruncated = true;
+      }
+
+      const lastReturnedLine = offset + slice.length;
+      const notes: string[] = [];
+      if (lastReturnedLine < totalLines) {
+        notes.push(`...[${totalLines - lastReturnedLine} more lines — call with offset=${lastReturnedLine}]`);
+      }
+      if (charTruncated) {
+        notes.push(`...[truncated at ${MAX_READ_CHARS} chars — call with a smaller limit]`);
+      }
+      if (notes.length) text += "\n" + notes.join("\n");
+
+      return {
+        content: [{ type: "text", text }],
+        details: { path: resolved, size: full.length, totalLines, offset, returnedLines: slice.length },
+      };
     } catch (e: any) {
       return { content: [{ type: "text", text: `Error reading file: ${e.message}` }], details: { error: e.message } };
     }
