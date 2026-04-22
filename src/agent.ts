@@ -21,28 +21,52 @@ import { traceTools } from "./tracing.js";
 import { restoreSession } from "./session.js";
 import { checkPermission } from "./permissions.js";
 
-const staticTools: AgentTool[] = [
-  // GPU
-  wakeGpu, shutdownGpu, gpuStatus,
-  // File system
+/**
+ * Core tools — always registered. Small, general-purpose surface the model
+ * will want on virtually every task.
+ */
+const coreTools: AgentTool[] = [
   readFileTool, writeFileTool, listFilesTool,
-  // Remote
-  sshToNas, delegateToNix,
-  // Browser
-  browserControl,
-  // LinkedIn
-  linkedinSearch, linkedinResults,
-  // iOS
-  iosListDevices, iosBuild, iosInstall, iosBuildAndDeploy,
-  // Launchpad
-  launchpadRunScraper, launchpadDeploy, launchpadScrape,
-  // browser-use agentic tasks
-  browserTask,
-  // Shell
   runShell,
-  // Claude Code delegation
-  delegateToClaudeSubagent,
+  sshToNas,
+  delegateToNix,
+  wakeGpu, shutdownGpu, gpuStatus,
 ];
+
+/**
+ * Specialized tool groups — opt in via env flags. Each group adds ~hundreds
+ * of tokens of schema to every single request; only register what's needed.
+ *
+ *   MAX_TOOLS_BROWSER=true   browser_control + browser_task
+ *   MAX_TOOLS_LINKEDIN=true  linkedin_search + linkedin_results
+ *   MAX_TOOLS_IOS=true       ios_list_devices + ios_build + ios_install + ios_build_and_deploy
+ *   MAX_TOOLS_LAUNCHPAD=true launchpad_run_scraper + launchpad_deploy + launchpad_scrape
+ *   MAX_TOOLS_SUBAGENT=true  delegate_to_claude_subagent
+ *   MAX_TOOLS_ALL=true       everything (back-compat with pre-split behaviour)
+ */
+const toolGroups: Record<string, AgentTool[]> = {
+  BROWSER: [browserControl, browserTask],
+  LINKEDIN: [linkedinSearch, linkedinResults],
+  IOS: [iosListDevices, iosBuild, iosInstall, iosBuildAndDeploy],
+  LAUNCHPAD: [launchpadRunScraper, launchpadDeploy, launchpadScrape],
+  SUBAGENT: [delegateToClaudeSubagent],
+};
+
+function buildStaticTools(): AgentTool[] {
+  const all = process.env.MAX_TOOLS_ALL === "true";
+  const enabled: AgentTool[] = [...coreTools];
+  const activeGroups: string[] = ["core"];
+  for (const [group, tools] of Object.entries(toolGroups)) {
+    if (all || process.env[`MAX_TOOLS_${group}`] === "true") {
+      enabled.push(...tools);
+      activeGroups.push(group.toLowerCase());
+    }
+  }
+  log("info", `Tool groups active: ${activeGroups.join(", ")} (${enabled.length} tools)`);
+  return enabled;
+}
+
+const staticTools: AgentTool[] = buildStaticTools();
 
 function inferProvider(modelId: string): "anthropic" | "google" {
   return modelId.startsWith("claude") ? "anthropic" : "google";
