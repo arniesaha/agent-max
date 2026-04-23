@@ -1,9 +1,12 @@
 import { readFile, writeFile, mkdir } from "fs/promises";
 import { existsSync } from "fs";
 import path from "path";
+import { log } from "./logger.js";
 
 const MAX_HOME = path.join(process.env.HOME!, "max");
 const MEMORY_DIR = path.join(MAX_HOME, "memory");
+
+const MAX_MEMORY_FILE_CHARS = Number(process.env.MAX_MEMORY_FILE_CHARS) || 20_000;
 
 function formatDate(d: Date): string {
   return d.toISOString().slice(0, 10);
@@ -17,7 +20,12 @@ function subDays(d: Date, n: number): Date {
 
 async function readFileSafe(p: string): Promise<string> {
   try {
-    return await readFile(p, "utf-8");
+    const content = await readFile(p, "utf-8");
+    if (content.length > MAX_MEMORY_FILE_CHARS) {
+      log("warn", `Memory file ${p} is ${content.length} chars, exceeds cap of ${MAX_MEMORY_FILE_CHARS}; truncating head`);
+      return content.slice(0, MAX_MEMORY_FILE_CHARS) + `\n\n[truncated ${content.length - MAX_MEMORY_FILE_CHARS} chars — cap is MAX_MEMORY_FILE_CHARS=${MAX_MEMORY_FILE_CHARS}]`;
+    }
+    return content;
   } catch {
     return "";
   }
