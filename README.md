@@ -102,6 +102,25 @@ Requirements:
 - `claude` CLI installed and authenticated on the host
 - `ANTHROPIC_BASE_URL` should point to your AgentWeave proxy if you want subagent LLM calls visible in AgentWeave
 
+### Context sizing
+
+Max automatically compacts old history once the running token estimate crosses a threshold. Defaults target a Claude subscription, where every input token counts against the 5-hour rate limit:
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `MAX_CONTEXT_WINDOW` | `200000` | Upper bound used for budget math |
+| `MAX_COMPACT_THRESHOLD` | `0.75` | Fraction of the window before compaction kicks in (default = 150K tokens) |
+| `MAX_KEEP_RECENT` | `6` | Messages always kept intact at the tail |
+
+For Gemini direct or other cheap-long-context providers, raise the window:
+
+```bash
+MAX_CONTEXT_WINDOW=1000000
+MAX_COMPACT_THRESHOLD=0.8
+```
+
+The effective values are logged once on the first `transformContext` call.
+
 ### Development
 
 ```bash
