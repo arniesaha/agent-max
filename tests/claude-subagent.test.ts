@@ -71,19 +71,19 @@ describe("output truncation", () => {
     expect(truncateOutput(text)).toBe(text);
   });
 
-  it("truncates to the last MAX_OUTPUT_CHARS characters when over limit", () => {
-    // prefix is longer than MAX_OUTPUT_CHARS — entirely dropped by truncation
-    const prefix = "OLD".repeat(6000);   // 18000 chars — older output, should be cut
-    const tail = "NEW".repeat(2000);     // 6000 chars — recent output, should be kept
-    const combined = prefix + tail;
+  it("keeps head and tail, drops the middle, when over limit", () => {
+    const head = "HEAD".repeat(3000);    // 12000 chars — start of output
+    const middle = "MID".repeat(4000);   // 12000 chars — will be dropped
+    const tail = "TAIL".repeat(1000);    // 4000 chars — end of output
+    const combined = head + middle + tail;
     expect(combined.length).toBeGreaterThan(MAX_OUTPUT_CHARS);
 
     const result = truncateOutput(combined);
-    expect(result.length).toBe(MAX_OUTPUT_CHARS);
-    // The tail must be fully present at the end of the result
+    // Head+tail split (default 70/30) keeps ~10500 head + 4500 tail from budget 15000
+    expect(result.startsWith(head.slice(0, 1000))).toBe(true);
     expect(result.endsWith(tail)).toBe(true);
-    // The very start of the result should not be the beginning of prefix
-    expect(result).not.toBe(combined);
+    expect(result).toContain("[truncated");
+    expect(result).not.toContain(middle);
   });
 });
 
