@@ -5,6 +5,7 @@ import { createAgent } from "./agent.js";
 import { setAgentWeaveSession, resetAgentWeaveSession } from "./agentweave-context.js";
 import { log } from "./logger.js";
 import { saveSession } from "./session.js";
+import { emitSessionArtifact, inferProjectsFromText } from "./session-emit.js";
 
 const AGENTWEAVE_MAX_PROXY = process.env.AGENTWEAVE_PROXY_URL || "http://arnabsnas.local:30400";
 
@@ -98,14 +99,29 @@ async function main() {
       const lastMsg: any = agent.state.messages[agent.state.messages.length - 1];
       if (lastMsg?.role === "assistant" && lastMsg.stopReason === "error" && lastMsg.errorMessage) {
         saveSession(agent);
+        emitSessionArtifact({
+          topic: taskLabel || text.slice(0, 80),
+          projects: inferProjectsFromText(text),
+          type: "maintenance",
+        });
         await postProgress({ type: "error", taskId, error: `LLM error: ${lastMsg.errorMessage}` });
         return;
       }
     }
 
     saveSession(agent);
+    emitSessionArtifact({
+      topic: taskLabel || text.slice(0, 80),
+      projects: inferProjectsFromText(text),
+      type: "coding",
+    });
     await postProgress({ type: "complete", taskId, message: "Worker completed", result: responseText });
   } catch (e: any) {
+    emitSessionArtifact({
+      topic: taskLabel || text.slice(0, 80),
+      projects: inferProjectsFromText(text),
+      type: "maintenance",
+    });
     await postProgress({ type: "error", taskId, error: e?.message || String(e) });
   } finally {
     if (parentSessionId) {
