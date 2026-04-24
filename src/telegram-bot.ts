@@ -285,6 +285,7 @@ export function createTelegramBot(agent: Agent): Bot {
 
     let responseText = "";
     let lastEditedText = "⏳ Thinking...";
+    let lastAnswerEditedText = "";
     let statusLabel = "⏳ Thinking";
     let spinnerIdx = 0;
     let editTimer: ReturnType<typeof setInterval> | null = null;
@@ -293,16 +294,19 @@ export function createTelegramBot(agent: Agent): Bot {
     let lastStatusEditAt = 0;
     let pendingStatusEdit: ReturnType<typeof setTimeout> | null = null;
     const pendingImages: { data: string; mimeType: string; caption?: string }[] = [];
-    const toolLog: string[] = []; // accumulates completed tool labels
+    // Collapsed tool log: consecutive duplicates merged to "<entry> (×N)"
+    const toolLog: { entry: string; count: number }[] = [];
 
-    // Rolling message split state
-    let currentMsgId = messageId;
+    // Status bubble (edits only, no notifications) vs. answer bubble (new message → push notification)
+    const statusMsgId = messageId;
+    let currentMsgId: number | null = null; // answer bubble — created lazily on first text delta
     const allChunks: string[] = []; // finalized chunks for history reconstruction
 
-    // Rate-limited status edit — pushes immediately if enough time elapsed, else schedules
+    // Rate-limited status edit — always targets the status bubble (statusMsgId).
+    // Answer streaming lives in its own bubble (currentMsgId), so status keeps updating
+    // even after the answer starts arriving.
     const editStatus = (newLabel: string) => {
       statusLabel = newLabel;
-      if (responseText.length > 0) return; // don't overwrite streaming text
 
       const now = Date.now();
       const elapsed = now - lastStatusEditAt;
@@ -312,7 +316,7 @@ export function createTelegramBot(agent: Agent): Bot {
         const displayText = buildStatusText();
         if (displayText === lastEditedText) return;
         try {
-          await bot.api.editMessageText(chatId, messageId, displayText);
+          await bot.api.editMessageText(chatId, statusMsgId, displayText);
           lastEditedText = displayText;
           lastStatusEditAt = Date.now();
         } catch (e: any) {
@@ -338,13 +342,23 @@ export function createTelegramBot(agent: Agent): Bot {
     const buildStatusText = (): string => {
       const spinner = SPINNER[spinnerIdx];
       const lines: string[] = [];
-      // Show completed tools
-      for (const entry of toolLog) {
-        lines.push(entry);
+      for (const { entry, count } of toolLog) {
+        lines.push(count > 1 ? `${entry} (×${count})` : entry);
       }
-      // Show current status with spinner
-      lines.push(`${spinner} ${statusLabel}...`);
-      return lines.join("\n");
+      // If the answer has started streaming, drop the spinner line to avoid
+      // duplicating it below the (separate) answer bubble.
+      if (!isStreaming) lines.push(`${spinner} ${statusLabel}...`);
+      return lines.join("\n") || `${spinner} ${statusLabel}...`;
+    };
+
+    // Append a completed tool entry, collapsing consecutive duplicates.
+    const appendToolEntry = (entry: string) => {
+      const last = toolLog[toolLog.length - 1];
+      if (last && last.entry === entry) {
+        last.count += 1;
+      } else {
+        toolLog.push({ entry, count: 1 });
+      }
     };
 
     // Keep typing indicator alive
@@ -357,24 +371,33 @@ export function createTelegramBot(agent: Agent): Bot {
     const startEditing = () => {
       editTimer = setInterval(async () => {
         if (responseText.length > 0) {
+          // Lazy-create the answer bubble on first text delta → push notification fires.
+          if (currentMsgId === null) {
+            try {
+              const display = responseText + " ▍";
+              currentMsgId = await sendWithFormat(bot, chatId, display);
+              lastAnswerEditedText = responseText;
+            } catch (e: any) {
+              log("warn", `Failed to send answer message: ${e.message}`);
+            }
+            return;
+          }
+
           // Streaming text — check if we need to split into a new message
           if (responseText.length > MAX_MSG_LEN) {
-            // Find a natural split point: paragraph > sentence > word
             const splitAt = findSplitPoint(responseText, MAX_MSG_LEN);
             const chunk = responseText.slice(0, splitAt);
             const remainder = responseText.slice(splitAt).trimStart();
 
-            // Finalize current message with the chunk (no cursor)
             await editWithFormat(bot, chatId, currentMsgId, chunk);
             allChunks.push(chunk);
 
-            // Send a new message for the remainder — small delay for ordering
             try {
               await new Promise(r => setTimeout(r, 200));
               const newMsgId = await sendWithFormat(bot, chatId, remainder + " ▍");
               currentMsgId = newMsgId;
               responseText = remainder;
-              lastEditedText = remainder;
+              lastAnswerEditedText = remainder;
             } catch (e: any) {
               log("warn", `Failed to send continuation message: ${e.message}`);
             }
@@ -382,18 +405,17 @@ export function createTelegramBot(agent: Agent): Bot {
           }
 
           // Normal streaming edit
-          if (responseText === lastEditedText) return;
+          if (responseText === lastAnswerEditedText) return;
           const display = responseText + " ▍";
 
           try {
             await bot.api.editMessageText(chatId, currentMsgId, mdToHtml(display), { parse_mode: "HTML" });
-            lastEditedText = responseText;
+            lastAnswerEditedText = responseText;
           } catch (e: any) {
             if (e.message?.includes("message is not modified")) return;
-            // HTML failed mid-stream — fall back to plain
             try {
               await bot.api.editMessageText(chatId, currentMsgId, display);
-              lastEditedText = responseText;
+              lastAnswerEditedText = responseText;
             } catch (e2: any) {
               if (!e2.message?.includes("message is not modified")) {
                 log("warn", `Edit failed: ${e2.message}`);
@@ -428,7 +450,7 @@ export function createTelegramBot(agent: Agent): Bot {
           case "tool_execution_end": {
             const label = TOOL_LABELS[event.toolName] || `🔧 ${event.toolName}`;
             const icon = event.isError ? "❌" : "✅";
-            toolLog.push(`${icon} ${label}`);
+            appendToolEntry(`${icon} ${label}`);
             log("info", `Tool ended: ${event.toolName} (error: ${event.isError})`);
             // Capture image results for sending as photos
             if (!event.isError && event.result?.content) {
@@ -492,13 +514,37 @@ export function createTelegramBot(agent: Agent): Bot {
         }
       }
 
-      // Final edit — finalize the current (possibly split) message
+      // Finalize status bubble: drop the live spinner, leaving just the tool log.
+      // If nothing happened (no tools), collapse the status bubble to a one-liner.
+      try {
+        const statusFinal = toolLog.length > 0
+          ? toolLog.map(({ entry, count }) => (count > 1 ? `${entry} (×${count})` : entry)).join("\n")
+          : "✅ Done";
+        if (statusFinal !== lastEditedText) {
+          await bot.api.editMessageText(chatId, statusMsgId, statusFinal);
+        }
+      } catch (e: any) {
+        if (!e.message?.includes("message is not modified")) {
+          log("warn", `Final status edit failed: ${e.message}`);
+        }
+      }
+
+      // Finalize the answer. If we never opened an answer bubble (e.g. tool-only turn,
+      // or the response arrived after streaming ended), send it as a new message so a
+      // push notification fires.
       if (responseText.length <= MAX_MSG_LEN) {
-        await editWithFormat(bot, chatId, currentMsgId, responseText);
+        if (currentMsgId === null) {
+          currentMsgId = await sendWithFormat(bot, chatId, responseText);
+        } else {
+          await editWithFormat(bot, chatId, currentMsgId, responseText);
+        }
       } else {
-        // Still too long after streaming — split remaining
         const chunks = splitMessage(responseText, MAX_MSG_LEN);
-        await editWithFormat(bot, chatId, currentMsgId, chunks[0]);
+        if (currentMsgId === null) {
+          currentMsgId = await sendWithFormat(bot, chatId, chunks[0]);
+        } else {
+          await editWithFormat(bot, chatId, currentMsgId, chunks[0]);
+        }
         for (let i = 1; i < chunks.length; i++) {
           await replyWithFormat(ctx, chunks[i]);
         }
@@ -536,7 +582,11 @@ export function createTelegramBot(agent: Agent): Bot {
       log("error", `Agent error: ${e.message}`);
       updateTaskStatus(task.id, "failed", { error: e.message });
       try {
-        await bot.api.editMessageText(chatId, currentMsgId, `❌ Error: ${e.message}`);
+        if (currentMsgId !== null) {
+          await bot.api.editMessageText(chatId, currentMsgId, `❌ Error: ${e.message}`);
+        } else {
+          await ctx.reply(`❌ Error: ${e.message}`);
+        }
       } catch {
         await ctx.reply(`❌ Error: ${e.message}`);
       }
