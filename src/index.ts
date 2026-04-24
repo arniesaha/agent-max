@@ -5,6 +5,7 @@ import { createTelegramBot } from "./telegram-bot.js";
 import { startA2AServer } from "./a2a-server.js";
 import { getDb, getIncompleteTasks, updateTaskStatus } from "./task-journal.js";
 import { writeMemoryEvent } from "./memory.js";
+import { emitSessionArtifact } from "./session-emit.js";
 import { log } from "./logger.js";
 
 async function main() {
@@ -54,6 +55,7 @@ async function main() {
   const shutdown = async (signal: string) => {
     log("info", `Received ${signal}, shutting down...`);
     await writeMemoryEvent(`Max agent shutting down (${signal})`);
+    emitSessionArtifact({ topic: `Max agent shutdown (${signal})`, type: "maintenance" });
     bot.stop();
     process.exit(0);
   };
