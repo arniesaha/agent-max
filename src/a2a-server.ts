@@ -11,6 +11,7 @@ import {
   appendActivity,
   getUnreportedActivity,
   advanceReportedSeq,
+  setActualCost,
 } from "./task-journal.js";
 import { setAgentWeaveSession, resetAgentWeaveSession } from "./agentweave-context.js";
 import { log } from "./logger.js";
@@ -23,6 +24,25 @@ import { receiveCallback } from "./tools/claude-subagent.js";
 const A2A_PORT = parseInt(process.env.A2A_PORT || "8770", 10);
 const A2A_SHARED_SECRET = process.env.A2A_SHARED_SECRET || "";
 const startTime = Date.now();
+
+/**
+ * Default per-task USD spend cap for async A2A worker tasks. Overridable by
+ * the dispatcher per task via params.metadata.maxBudgetUsd. A 0 or negative
+ * cap disables enforcement for that task.
+ */
+function defaultBudgetCapUsd(): number {
+  const raw = parseFloat(process.env.MAX_DEFAULT_BUDGET_USD || "0.50");
+  return Number.isFinite(raw) ? raw : 0.5;
+}
+
+function resolveBudgetCap(metadata: unknown): number | null {
+  const m = metadata as { maxBudgetUsd?: number; max_budget_usd?: number } | null | undefined;
+  const raw = m?.maxBudgetUsd ?? m?.max_budget_usd;
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    return raw <= 0 ? null : raw;
+  }
+  return defaultBudgetCapUsd();
+}
 
 const AGENTWEAVE_MAX_PROXY = process.env.AGENTWEAVE_PROXY_URL || "http://arnabsnas.local:30400";
 
@@ -122,7 +142,10 @@ export function createA2AServer(agent: Agent): express.Express {
       const isSync = String(req.query.sync || "false").toLowerCase() === "true";
       log("info", `A2A task from ${callerAgentId || "unknown"} (${isSync ? "sync" : "async"}): ${text.slice(0, 100)}`);
 
-      const task = createTask("a2a_task", "nix", { text, metadata: params.metadata });
+      // Async tasks get a USD spend cap; sync tasks inherit caller's request
+      // lifetime so a budget enforcement abort there would just be confusing.
+      const budgetCapUsd = isSync ? null : resolveBudgetCap(params.metadata);
+      const task = createTask("a2a_task", "nix", { text, metadata: params.metadata }, { budgetCapUsd });
       taskId = task.id;
       updateTaskStatus(task.id, "working");
 
@@ -142,6 +165,7 @@ export function createA2AServer(agent: Agent): express.Express {
               callerAgentId,
               taskLabel,
               traceHeaders,
+              maxBudgetUsd: budgetCapUsd,
             },
           });
 
@@ -155,6 +179,7 @@ export function createA2AServer(agent: Agent): express.Express {
                 void drainActivityToTelegram(task.id);
               }
             } else if (event.type === "complete") {
+              if (typeof event.costUsd === "number") setActualCost(task.id, event.costUsd);
               updateTaskStatus(task.id, "completed", { response: event.result || "" });
               if (!isSilent) {
                 void relayJobCompletionToTelegram({
@@ -166,6 +191,7 @@ export function createA2AServer(agent: Agent): express.Express {
               }
               worker.terminate().catch(() => {});
             } else if (event.type === "error") {
+              if (typeof event.costUsd === "number") setActualCost(task.id, event.costUsd);
               updateTaskStatus(task.id, "failed", { error: event.error || "Unknown error" });
               if (!isSilent) {
                 void relayJobCompletionToTelegram({

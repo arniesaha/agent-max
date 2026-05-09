@@ -21,6 +21,8 @@ export interface TaskRecord {
   updated_at: number;
   retry_count: number;
   last_reported_seq: number;
+  budget_cap_usd: number | null;
+  actual_cost_usd: number | null;
 }
 
 export interface TaskActivity {
@@ -47,7 +49,9 @@ export function getDb(): Database.Database {
         created_at        INTEGER NOT NULL,
         updated_at        INTEGER NOT NULL,
         retry_count       INTEGER NOT NULL DEFAULT 0,
-        last_reported_seq INTEGER NOT NULL DEFAULT 0
+        last_reported_seq INTEGER NOT NULL DEFAULT 0,
+        budget_cap_usd    REAL,
+        actual_cost_usd   REAL
       );
 
       CREATE TABLE IF NOT EXISTS task_activity (
@@ -68,10 +72,19 @@ export function getDb(): Database.Database {
       );
     `);
 
-    // Backfill: existing prod DBs predate last_reported_seq.
+    // Backfill columns added after the original schema. PRAGMA table_info
+    // is the cheapest "does this column exist?" check; ALTER TABLE ADD COLUMN
+    // doesn't have an IF NOT EXISTS clause in SQLite.
     const cols = db.prepare(`PRAGMA table_info(tasks)`).all() as { name: string }[];
-    if (!cols.some((c) => c.name === "last_reported_seq")) {
+    const colNames = new Set(cols.map((c) => c.name));
+    if (!colNames.has("last_reported_seq")) {
       db.exec(`ALTER TABLE tasks ADD COLUMN last_reported_seq INTEGER NOT NULL DEFAULT 0`);
+    }
+    if (!colNames.has("budget_cap_usd")) {
+      db.exec(`ALTER TABLE tasks ADD COLUMN budget_cap_usd REAL`);
+    }
+    if (!colNames.has("actual_cost_usd")) {
+      db.exec(`ALTER TABLE tasks ADD COLUMN actual_cost_usd REAL`);
     }
   }
   return db;
@@ -90,8 +103,18 @@ export function _resetDbForTest(): void {
   db = null;
 }
 
-export function createTask(type: TaskType, source: TaskSource, payload: unknown): TaskRecord {
+export interface CreateTaskOptions {
+  budgetCapUsd?: number | null;
+}
+
+export function createTask(
+  type: TaskType,
+  source: TaskSource,
+  payload: unknown,
+  options: CreateTaskOptions = {}
+): TaskRecord {
   const now = Date.now();
+  const budgetCapUsd = options.budgetCapUsd ?? null;
   const task: TaskRecord = {
     id: randomUUID(),
     type,
@@ -103,14 +126,27 @@ export function createTask(type: TaskType, source: TaskSource, payload: unknown)
     updated_at: now,
     retry_count: 0,
     last_reported_seq: 0,
+    budget_cap_usd: budgetCapUsd,
+    actual_cost_usd: null,
   };
 
   getDb()
     .prepare(
-      `INSERT INTO tasks (id, type, source, payload, status, result, created_at, updated_at, retry_count)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO tasks (id, type, source, payload, status, result, created_at, updated_at, retry_count, budget_cap_usd)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
-    .run(task.id, task.type, task.source, task.payload, task.status, task.result, task.created_at, task.updated_at, task.retry_count);
+    .run(
+      task.id,
+      task.type,
+      task.source,
+      task.payload,
+      task.status,
+      task.result,
+      task.created_at,
+      task.updated_at,
+      task.retry_count,
+      budgetCapUsd
+    );
 
   return task;
 }
@@ -119,6 +155,12 @@ export function updateTaskStatus(id: string, status: TaskStatus, result?: unknow
   getDb()
     .prepare(`UPDATE tasks SET status = ?, result = ?, updated_at = ? WHERE id = ?`)
     .run(status, result ? JSON.stringify(result) : null, Date.now(), id);
+}
+
+export function setActualCost(id: string, costUsd: number): void {
+  getDb()
+    .prepare(`UPDATE tasks SET actual_cost_usd = ?, updated_at = ? WHERE id = ?`)
+    .run(costUsd, Date.now(), id);
 }
 
 export function getIncompleteTasks(): TaskRecord[] {
