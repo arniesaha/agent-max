@@ -15,6 +15,10 @@ export interface WorkerProgressEvent {
   message?: string;
   result?: string;
   error?: string;
+  /** Cumulative cost in USD at terminal events (complete/error). */
+  costUsd?: number;
+  /** True when termination was caused by exceeding the per-task budget cap. */
+  budgetExceeded?: boolean;
 }
 
 interface WorkerTaskData {
@@ -26,6 +30,19 @@ interface WorkerTaskData {
   taskLabel?: string;
   /** Serialized W3C trace headers (e.g. traceparent) from the calling agent. */
   traceHeaders?: Record<string, string>;
+  /** Per-task USD spend cap. When exceeded, the agent is aborted. */
+  maxBudgetUsd?: number | null;
+}
+
+/**
+ * Extract USD cost from a turn_end event. Returns 0 for non-assistant turns
+ * or messages without usage data. Pure helper, exported for tests.
+ */
+export function costFromTurnEnd(message: unknown): number {
+  if (!message || typeof message !== "object") return 0;
+  const m = message as { role?: string; usage?: { cost?: { total?: number } } };
+  if (m.role !== "assistant") return 0;
+  return m.usage?.cost?.total ?? 0;
 }
 
 async function postProgress(event: WorkerProgressEvent): Promise<void> {
@@ -33,7 +50,7 @@ async function postProgress(event: WorkerProgressEvent): Promise<void> {
 }
 
 async function main() {
-  const { taskId, text, parentSessionId, delegatedSessionId, callerAgentId, taskLabel, traceHeaders } = workerData as WorkerTaskData;
+  const { taskId, text, parentSessionId, delegatedSessionId, callerAgentId, taskLabel, traceHeaders, maxBudgetUsd } = workerData as WorkerTaskData;
 
   // Re-extract trace context from serialized headers so this worker's spans
   // are linked as children of the calling agent's trace.
@@ -42,6 +59,8 @@ async function main() {
     : context.active();
   const AGENTWEAVE_PROXY_TOKEN = process.env.AGENTWEAVE_PROXY_TOKEN;
 
+  // Hoisted so the catch block can include accumulated cost in its error event.
+  let cumulativeCostUsd = 0;
   await context.with(incomingContext, async () => {
   try {
     await postProgress({ type: "progress", taskId, message: "Worker started" });
@@ -70,6 +89,7 @@ async function main() {
 
     const agent = await createAgent();
     let responseText = "";
+    let budgetExceeded = false;
 
     const unsub = agent.subscribe((event: AgentEvent) => {
       if (event.type === "tool_execution_start") {
@@ -78,10 +98,43 @@ async function main() {
       if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
         responseText += event.assistantMessageEvent.delta;
       }
+      if (event.type === "turn_end") {
+        cumulativeCostUsd += costFromTurnEnd(event.message);
+        if (
+          typeof maxBudgetUsd === "number" &&
+          maxBudgetUsd > 0 &&
+          !budgetExceeded &&
+          cumulativeCostUsd > maxBudgetUsd
+        ) {
+          budgetExceeded = true;
+          log(
+            "warn",
+            `Task ${taskId} exceeded budget cap: $${cumulativeCostUsd.toFixed(4)} > $${maxBudgetUsd.toFixed(2)} — aborting`
+          );
+          agent.abort();
+        }
+      }
     });
 
     await agent.prompt(text);
     unsub();
+
+    if (budgetExceeded) {
+      saveSession(agent);
+      emitSessionArtifact({
+        topic: taskLabel || text.slice(0, 80),
+        projects: inferProjectsFromText(text),
+        type: "maintenance",
+      });
+      await postProgress({
+        type: "error",
+        taskId,
+        error: `Budget exceeded: $${cumulativeCostUsd.toFixed(4)} of $${(maxBudgetUsd as number).toFixed(2)} cap`,
+        costUsd: cumulativeCostUsd,
+        budgetExceeded: true,
+      });
+      return;
+    }
 
     if (!responseText) {
       const lastMsg = agent.state.messages[agent.state.messages.length - 1];
@@ -104,7 +157,12 @@ async function main() {
           projects: inferProjectsFromText(text),
           type: "maintenance",
         });
-        await postProgress({ type: "error", taskId, error: `LLM error: ${lastMsg.errorMessage}` });
+        await postProgress({
+          type: "error",
+          taskId,
+          error: `LLM error: ${lastMsg.errorMessage}`,
+          costUsd: cumulativeCostUsd,
+        });
         return;
       }
     }
@@ -115,14 +173,25 @@ async function main() {
       projects: inferProjectsFromText(text),
       type: "coding",
     });
-    await postProgress({ type: "complete", taskId, message: "Worker completed", result: responseText });
+    await postProgress({
+      type: "complete",
+      taskId,
+      message: "Worker completed",
+      result: responseText,
+      costUsd: cumulativeCostUsd,
+    });
   } catch (e: any) {
     emitSessionArtifact({
       topic: taskLabel || text.slice(0, 80),
       projects: inferProjectsFromText(text),
       type: "maintenance",
     });
-    await postProgress({ type: "error", taskId, error: e?.message || String(e) });
+    await postProgress({
+      type: "error",
+      taskId,
+      error: e?.message || String(e),
+      costUsd: cumulativeCostUsd,
+    });
   } finally {
     if (parentSessionId) {
       resetAgentWeaveSession();
@@ -145,4 +214,9 @@ async function main() {
   }); // end context.with
 }
 
-void main();
+// Only auto-run when actually loaded as a worker thread (parentPort exists
+// and workerData is set). Lets tests import pure helpers from this file
+// without spinning up the agent.
+if (parentPort && workerData) {
+  void main();
+}

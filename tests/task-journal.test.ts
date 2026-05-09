@@ -112,3 +112,89 @@ describe("task-journal activity watermarking", () => {
     expect(row.last_reported_seq).toBe(0);
   });
 });
+
+describe("task-journal budget cap persistence", () => {
+  it("createTask with budgetCapUsd persists the cap and starts cost null", async () => {
+    const { createTask, getDb } = await import("../src/task-journal.js");
+    const task = createTask("a2a_task", "nix", { text: "x" }, { budgetCapUsd: 0.25 });
+    const row = getDb()
+      .prepare(`SELECT budget_cap_usd, actual_cost_usd FROM tasks WHERE id = ?`)
+      .get(task.id) as { budget_cap_usd: number; actual_cost_usd: number | null };
+    expect(row.budget_cap_usd).toBeCloseTo(0.25);
+    expect(row.actual_cost_usd).toBeNull();
+  });
+
+  it("createTask without options leaves budget_cap_usd null", async () => {
+    const { createTask, getDb } = await import("../src/task-journal.js");
+    const task = createTask("a2a_task", "nix", { text: "x" });
+    const row = getDb()
+      .prepare(`SELECT budget_cap_usd FROM tasks WHERE id = ?`)
+      .get(task.id) as { budget_cap_usd: number | null };
+    expect(row.budget_cap_usd).toBeNull();
+  });
+
+  it("setActualCost writes the cost to the task row", async () => {
+    const { createTask, setActualCost, getDb } = await import("../src/task-journal.js");
+    const task = createTask("a2a_task", "nix", { text: "x" }, { budgetCapUsd: 0.5 });
+    setActualCost(task.id, 0.1234);
+    const row = getDb()
+      .prepare(`SELECT actual_cost_usd FROM tasks WHERE id = ?`)
+      .get(task.id) as { actual_cost_usd: number };
+    expect(row.actual_cost_usd).toBeCloseTo(0.1234);
+  });
+
+  it("schema migration is idempotent against an existing DB without budget cols", async () => {
+    // Simulate an older prod DB: open with raw sqlite + the original schema,
+    // then let our getDb() open it and perform the ALTER backfills.
+    const Database = (await import("better-sqlite3")).default;
+    const dbFile = process.env.MAX_DB_PATH!;
+    const raw = new Database(dbFile);
+    raw.exec(`
+      CREATE TABLE tasks (
+        id          TEXT PRIMARY KEY,
+        type        TEXT NOT NULL,
+        source      TEXT NOT NULL,
+        payload     TEXT NOT NULL,
+        status      TEXT NOT NULL,
+        result      TEXT,
+        created_at  INTEGER NOT NULL,
+        updated_at  INTEGER NOT NULL,
+        retry_count INTEGER DEFAULT 0
+      );
+      INSERT INTO tasks VALUES ('legacy-1', 'a2a_task', 'nix', '{}', 'completed', null, 0, 0, 0);
+    `);
+    raw.close();
+
+    const { _resetDbForTest, getDb, createTask, setActualCost } = await import(
+      "../src/task-journal.js"
+    );
+    _resetDbForTest();
+
+    // Trigger migration
+    const cols = getDb()
+      .prepare(`PRAGMA table_info(tasks)`)
+      .all() as { name: string }[];
+    const colNames = new Set(cols.map((c) => c.name));
+    expect(colNames.has("last_reported_seq")).toBe(true);
+    expect(colNames.has("budget_cap_usd")).toBe(true);
+    expect(colNames.has("actual_cost_usd")).toBe(true);
+
+    // Existing legacy row has null budget_cap_usd, defaulted last_reported_seq = 0
+    const legacy = getDb()
+      .prepare(
+        `SELECT last_reported_seq, budget_cap_usd, actual_cost_usd FROM tasks WHERE id = 'legacy-1'`
+      )
+      .get() as {
+      last_reported_seq: number;
+      budget_cap_usd: number | null;
+      actual_cost_usd: number | null;
+    };
+    expect(legacy.last_reported_seq).toBe(0);
+    expect(legacy.budget_cap_usd).toBeNull();
+    expect(legacy.actual_cost_usd).toBeNull();
+
+    // Post-migration, new operations work
+    const t = createTask("a2a_task", "nix", { text: "post" }, { budgetCapUsd: 1 });
+    setActualCost(t.id, 0.5);
+  });
+});

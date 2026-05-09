@@ -104,6 +104,43 @@ describe("Telegram relay message format", () => {
 
 import { _clearJobsForTest, _addJobForTest } from "../src/tools/claude-subagent.js";
 
+// ─── Budget cap cost extraction ───────────────────────────────────────────────
+
+import { costFromTurnEnd } from "../src/worker.js";
+
+describe("costFromTurnEnd", () => {
+  it("returns 0 for null/undefined", () => {
+    expect(costFromTurnEnd(null)).toBe(0);
+    expect(costFromTurnEnd(undefined)).toBe(0);
+  });
+
+  it("returns 0 for non-assistant messages", () => {
+    expect(costFromTurnEnd({ role: "user", content: "hi" })).toBe(0);
+    expect(costFromTurnEnd({ role: "toolResult", content: [] })).toBe(0);
+  });
+
+  it("returns 0 when usage is missing", () => {
+    expect(costFromTurnEnd({ role: "assistant" })).toBe(0);
+    expect(costFromTurnEnd({ role: "assistant", usage: {} })).toBe(0);
+    expect(costFromTurnEnd({ role: "assistant", usage: { cost: {} } })).toBe(0);
+  });
+
+  it("returns the total cost from an assistant message usage", () => {
+    const msg = {
+      role: "assistant",
+      usage: {
+        input: 100,
+        output: 200,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 300,
+        cost: { input: 0.01, output: 0.05, cacheRead: 0, cacheWrite: 0, total: 0.06 },
+      },
+    };
+    expect(costFromTurnEnd(msg)).toBeCloseTo(0.06);
+  });
+});
+
 describe("DelegateJob silent flag", () => {
   it("silent=true is preserved in job object", () => {
     _clearJobsForTest();
