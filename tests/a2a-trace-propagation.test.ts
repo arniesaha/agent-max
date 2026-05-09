@@ -25,6 +25,9 @@ jest.unstable_mockModule("../src/task-journal.js", () => ({
       all: jest.fn().mockReturnValue([]),
     }),
   }),
+  appendActivity: jest.fn().mockReturnValue({ seq: 1 }),
+  getUnreportedActivity: jest.fn().mockReturnValue([]),
+  advanceReportedSeq: jest.fn(),
 }));
 jest.unstable_mockModule("../src/logger.js", () => ({ log: jest.fn() }));
 jest.unstable_mockModule("../src/session.js", () => ({
