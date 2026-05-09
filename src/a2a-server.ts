@@ -3,7 +3,15 @@ import { Worker } from "worker_threads";
 import { context, propagation } from "@opentelemetry/api";
 import type { Agent } from "@mariozechner/pi-agent-core";
 import type { AgentEvent } from "@mariozechner/pi-agent-core";
-import { createTask, updateTaskStatus, getRecentTasks, getDb } from "./task-journal.js";
+import {
+  createTask,
+  updateTaskStatus,
+  getRecentTasks,
+  getDb,
+  appendActivity,
+  getUnreportedActivity,
+  advanceReportedSeq,
+} from "./task-journal.js";
 import { setAgentWeaveSession, resetAgentWeaveSession } from "./agentweave-context.js";
 import { log } from "./logger.js";
 import { saveSession } from "./session.js";
@@ -36,6 +44,24 @@ const AGENT_CARD = {
     "ssh_to_nas",
   ],
 };
+
+/**
+ * Drain unreported activity entries to Telegram and advance the watermark.
+ * Idempotent: replays / restarts that re-emit the same progress events won't
+ * duplicate Telegram messages once the watermark has been advanced.
+ */
+async function drainActivityToTelegram(taskId: string): Promise<void> {
+  const entries = getUnreportedActivity(taskId);
+  if (entries.length === 0) return;
+  const lastSeq = entries[entries.length - 1].seq;
+  // Advance first, then send. This biases toward "may drop on crash" rather
+  // than "may duplicate on retry" — duplicates are the bug the watermark
+  // exists to prevent.
+  advanceReportedSeq(taskId, lastSeq);
+  for (const e of entries) {
+    await relayTaskUpdateToTelegram(taskId, e.message);
+  }
+}
 
 function authMiddleware(req: express.Request, res: express.Response, next: express.NextFunction): void {
   if (!A2A_SHARED_SECRET) return next();
@@ -125,7 +151,8 @@ export function createA2AServer(agent: Agent): express.Express {
             if (event.type === "progress") {
               updateTaskStatus(task.id, "working", { progress: event.message || "Working" });
               if (event.message) {
-                void relayTaskUpdateToTelegram(task.id, event.message);
+                appendActivity(task.id, event.message);
+                void drainActivityToTelegram(task.id);
               }
             } else if (event.type === "complete") {
               updateTaskStatus(task.id, "completed", { response: event.result || "" });
