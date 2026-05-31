@@ -244,8 +244,10 @@ export function createA2AServer(agent: Agent): express.Express {
         return;
       }
 
+      let activeSessionKey = "max-main";
       if (parentSessionId) {
         const sessionId = delegatedSessionId || `max-a2a-${task.id}`;
+        activeSessionKey = sessionId;
         try {
           await fetch(`${AGENTWEAVE_MAX_PROXY}/session`, {
             method: "POST",
@@ -262,6 +264,7 @@ export function createA2AServer(agent: Agent): express.Express {
           });
           log("info", `AgentWeave session set: ${sessionId} (parent: ${parentSessionId})`);
           setAgentWeaveSession(sessionId);
+          agent.sessionId = sessionId;
         } catch (e: any) {
           log("warn", `AgentWeave session set failed: ${e.message}`);
         }
@@ -288,7 +291,7 @@ export function createA2AServer(agent: Agent): express.Express {
           ? extractErrorFromTurn(agent.state.messages as any, turnStartIndex)
           : null;
 
-        saveSession(agent);
+        saveSession(agent, { sessionKey: activeSessionKey });
 
         if (llmError) {
           log("warn", `LLM error during A2A sync task ${task.id}: ${llmError}`);
@@ -396,7 +399,7 @@ export function createA2AServer(agent: Agent): express.Express {
 
       await agent.prompt(text);
       unsub();
-      saveSession(agent);
+      saveSession(agent, { sessionKey: agent.sessionId || "max-main" });
 
       updateTaskStatus(task.id, "completed", { response: "(streamed)" });
       sendEvent("task_end", { taskId: task.id, status: "completed" });

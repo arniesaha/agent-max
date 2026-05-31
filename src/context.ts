@@ -2,6 +2,9 @@ import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import type { AssistantMessage, Message } from "@mariozechner/pi-ai";
 import { getModel, getEnvApiKey, streamSimple } from "@mariozechner/pi-ai";
 import { log } from "./logger.js";
+import { getAgentWeaveSession } from "./agentweave-context.js";
+import { getSessionBrief } from "./session.js";
+import { traceContextEvent } from "./tracing.js";
 
 /**
  * Context-sizing knobs.
@@ -41,6 +44,7 @@ function logConfigOnce(): void {
 // otherwise re-bills itself on every subsequent agent iteration.
 const FRESH_TURNS = Math.floor(Number(process.env.MAX_FRESH_TURNS || 4));
 const STALE_STUB_CHARS = 200; // keep a tiny prefix for continuity
+const CONTEXT_NOTE_MAX_CHARS = 8_000;
 
 /** Rough token estimate: ~4 chars per token for text, actual usage for assistant messages */
 function estimateMessageTokens(msg: AgentMessage): number {
@@ -83,12 +87,30 @@ export interface ContextStats {
   contextWindow: number;
   compactThreshold: number;
   usagePercent: number;
+  pruningCount: number;
+  compactionCount: number;
   compactions: number;
+  sessionKey?: string;
 }
 
-let compactionCount = 0;
+const sessionCounters = new Map<string, { pruningCount: number; compactionCount: number }>();
 
-export function getContextStats(messages: AgentMessage[]): ContextStats {
+function normalizeSessionKey(sessionKey?: string): string {
+  return sessionKey || getAgentWeaveSession() || "max-main";
+}
+
+function getCounters(sessionKey: string): { pruningCount: number; compactionCount: number } {
+  let counters = sessionCounters.get(sessionKey);
+  if (!counters) {
+    counters = { pruningCount: 0, compactionCount: 0 };
+    sessionCounters.set(sessionKey, counters);
+  }
+  return counters;
+}
+
+export function getContextStats(messages: AgentMessage[], sessionKey?: string): ContextStats {
+  const key = normalizeSessionKey(sessionKey);
+  const counters = getCounters(key);
   const totalTokens = messages.reduce((sum, m) => sum + estimateMessageTokens(m), 0);
   return {
     totalTokens,
@@ -96,8 +118,83 @@ export function getContextStats(messages: AgentMessage[]): ContextStats {
     contextWindow: CONTEXT_WINDOW,
     compactThreshold: TOKEN_LIMIT,
     usagePercent: Math.round((totalTokens / CONTEXT_WINDOW) * 100),
-    compactions: compactionCount,
+    pruningCount: counters.pruningCount,
+    compactionCount: counters.compactionCount,
+    compactions: counters.compactionCount,
+    sessionKey: key,
   };
+}
+
+function countPrunedToolResults(before: AgentMessage[], after: AgentMessage[]): number {
+  let count = 0;
+  for (let i = 0; i < Math.min(before.length, after.length); i++) {
+    if (before[i] !== after[i] && (before[i] as Message).role === "toolResult") count++;
+  }
+  return count;
+}
+
+function messageText(msg: AgentMessage): string {
+  const m = msg as Message;
+  if (m.role === "user") {
+    if (typeof m.content === "string") return m.content;
+    return m.content
+      .filter((c) => c.type === "text")
+      .map((c) => (c as any).text)
+      .join("\n");
+  }
+  if (m.role === "assistant") {
+    return m.content
+      .filter((c) => c.type === "text")
+      .map((c) => (c as any).text)
+      .join("\n");
+  }
+  return m.content
+    .filter((c) => c.type === "text")
+    .map((c) => (c as any).text)
+    .join("\n");
+}
+
+function appendTextToUserMessage(msg: AgentMessage, note: string): AgentMessage {
+  const m = msg as Message;
+  if (m.role !== "user") return msg;
+  if (typeof m.content === "string") {
+    return { ...m, content: `${m.content}\n\n${note}` } as AgentMessage;
+  }
+  return { ...m, content: [...m.content, { type: "text", text: note }] } as AgentMessage;
+}
+
+function attachContextNoteToLatestUser(messages: AgentMessage[], note: string): AgentMessage[] {
+  const trimmedNote = note.length > CONTEXT_NOTE_MAX_CHARS
+    ? `${note.slice(0, CONTEXT_NOTE_MAX_CHARS)}\n[context note truncated]`
+    : note;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if ((messages[i] as Message).role !== "user") continue;
+    const out = messages.slice();
+    out[i] = appendTextToUserMessage(messages[i], trimmedNote);
+    return out;
+  }
+  return messages;
+}
+
+export function includeActiveBrief(messages: AgentMessage[], sessionKey?: string): AgentMessage[] {
+  const key = normalizeSessionKey(sessionKey);
+  const brief = getSessionBrief(key);
+  if (!brief?.brief_md?.trim()) return messages;
+
+  const latestUser = [...messages].reverse().find((msg) => (msg as Message).role === "user");
+  const latestUserText = latestUser ? messageText(latestUser).trim() : "";
+  if (brief.last_user_req && latestUserText && latestUserText === brief.last_user_req.trim()) {
+    return messages;
+  }
+
+  const note = [
+    "[Active session brief, for continuity only. The user's current request appears above.]",
+    brief.brief_md.trim(),
+    brief.current_objective ? `Current objective: ${brief.current_objective}` : "",
+    brief.suggested_next.length > 0 ? `Suggested next: ${brief.suggested_next.join("; ")}` : "",
+    brief.open_blockers ? `Open blockers: ${brief.open_blockers}` : "",
+  ].filter(Boolean).join("\n");
+  return attachContextNoteToLatestUser(messages, note);
 }
 
 /**
@@ -165,20 +262,34 @@ export function pruneStaleToolResults(
   return changed ? out : messages;
 }
 
-export async function transformContext(messages: AgentMessage[]): Promise<AgentMessage[]> {
+export async function transformContext(messages: AgentMessage[], sessionKey?: string): Promise<AgentMessage[]> {
   logConfigOnce();
+  const key = normalizeSessionKey(sessionKey);
+  const counters = getCounters(key);
 
   // Cheap in-session pruning first — runs every turn, strips old toolResult
   // bodies so a long merge/debug session doesn't re-bill huge diffs forever.
+  const beforePrune = messages;
   messages = pruneStaleToolResults(messages);
+  const pruned = countPrunedToolResults(beforePrune, messages);
+  if (pruned > 0) {
+    counters.pruningCount += pruned;
+    traceContextEvent("context.pruning", {
+      "session.id": key,
+      "prov.session.id": key,
+      "context.pruned_tool_results": pruned,
+      "context.pruning_count": counters.pruningCount,
+    }, () => undefined);
+    log("info", `Context pruning: pruned ${pruned} stale tool results for session ${key}`);
+  }
 
   const totalTokens = messages.reduce((sum, m) => sum + estimateMessageTokens(m), 0);
 
   if (totalTokens <= TOKEN_LIMIT) {
-    return messages;
+    return includeActiveBrief(messages, key);
   }
 
-  log("info", `Context compaction triggered: ${totalTokens} tokens > ${TOKEN_LIMIT} threshold (${messages.length} messages)`);
+  log("info", `Context compaction triggered for session ${key}: ${totalTokens} tokens > ${TOKEN_LIMIT} threshold (${messages.length} messages)`);
 
   // Find how many messages to compact — keep removing from front until under 50% of window
   const targetTokens = Math.floor(CONTEXT_WINDOW * 0.5);
@@ -300,15 +411,21 @@ export async function transformContext(messages: AgentMessage[]): Promise<AgentM
   const summaryText = llmSummary
     ? `[CONTEXT SUMMARY — compacted at ${timestamp}]\n\n${llmSummary}`
     : buildHeuristicSummary(toCompact);
-  const summaryMessage: AgentMessage = {
-    role: "user",
-    content: summaryText,
-    timestamp: Date.now(),
-  };
 
-  compactionCount++;
-  const newTokens = toKeep.reduce((sum, m) => sum + estimateMessageTokens(m), 0) + estimateMessageTokens(summaryMessage);
-  log("info", `Context compacted: ${toCompact.length} messages → summary. ${messages.length} → ${toKeep.length + 1} messages. ${totalTokens} → ~${newTokens} tokens. Compaction #${compactionCount}`);
+  counters.compactionCount++;
+  const compacted = attachContextNoteToLatestUser(toKeep, summaryText);
+  const withBrief = includeActiveBrief(compacted, key);
+  const newTokens = withBrief.reduce((sum, m) => sum + estimateMessageTokens(m), 0);
+  traceContextEvent("context.compaction", {
+    "session.id": key,
+    "prov.session.id": key,
+    "context.tokens_before": totalTokens,
+    "context.tokens_after": newTokens,
+    "context.messages_before": messages.length,
+    "context.messages_after": withBrief.length,
+    "context.compaction_count": counters.compactionCount,
+  }, () => undefined);
+  log("info", `Context compacted for session ${key}: ${toCompact.length} messages summarized. ${messages.length} → ${withBrief.length} messages. ${totalTokens} → ~${newTokens} tokens. Compaction #${counters.compactionCount}`);
 
-  return [summaryMessage, ...toKeep];
+  return withBrief;
 }

@@ -20,6 +20,7 @@ import { transformContext } from "./context.js";
 import { traceTools } from "./tracing.js";
 import { restoreSession } from "./session.js";
 import { checkPermission } from "./permissions.js";
+import { getAgentWeaveSession } from "./agentweave-context.js";
 
 /**
  * Core tools — always registered. Small, general-purpose surface the model
@@ -141,7 +142,8 @@ export async function createAgent(): Promise<Agent> {
       },
     });
 
-  const agent = new Agent({
+  let agent: Agent;
+  agent = new Agent({
     initialState: {
       systemPrompt,
       model,
@@ -155,7 +157,7 @@ export async function createAgent(): Promise<Agent> {
       }
       return getEnvApiKey(provider);
     },
-    transformContext,
+    transformContext: (messages) => transformContext(messages, agent.sessionId || getAgentWeaveSession()),
     streamFn: agentWeaveStreamFn,
   });
 
@@ -180,7 +182,8 @@ export async function createAgent(): Promise<Agent> {
   agent.state.tools = allTools;
 
   // Restore previous session messages
-  restoreSession(agent);
+  agent.sessionId = getAgentWeaveSession();
+  restoreSession(agent, { sessionKey: agent.sessionId });
 
   return agent;
 }

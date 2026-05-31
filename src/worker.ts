@@ -87,7 +87,9 @@ async function main() {
       }
     }
 
+    const activeSessionKey = delegatedSessionId || (parentSessionId ? `max-a2a-${taskId}` : "max-main");
     const agent = await createAgent();
+    agent.sessionId = activeSessionKey;
     let responseText = "";
     let budgetExceeded = false;
 
@@ -120,7 +122,7 @@ async function main() {
     unsub();
 
     if (budgetExceeded) {
-      saveSession(agent);
+      saveSession(agent, { sessionKey: activeSessionKey });
       emitSessionArtifact({
         topic: taskLabel || text.slice(0, 80),
         projects: inferProjectsFromText(text),
@@ -151,7 +153,7 @@ async function main() {
     if (!responseText) {
       const lastMsg: any = agent.state.messages[agent.state.messages.length - 1];
       if (lastMsg?.role === "assistant" && lastMsg.stopReason === "error" && lastMsg.errorMessage) {
-        saveSession(agent);
+        saveSession(agent, { sessionKey: activeSessionKey });
         emitSessionArtifact({
           topic: taskLabel || text.slice(0, 80),
           projects: inferProjectsFromText(text),
@@ -167,7 +169,7 @@ async function main() {
       }
     }
 
-    saveSession(agent);
+    saveSession(agent, { sessionKey: activeSessionKey });
     emitSessionArtifact({
       topic: taskLabel || text.slice(0, 80),
       projects: inferProjectsFromText(text),

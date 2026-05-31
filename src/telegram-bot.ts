@@ -247,9 +247,11 @@ export function createTelegramBot(agent: Agent): Bot {
 
   bot.command("clear", async (ctx) => {
     if (!isAllowed(ctx)) return;
+    const chatId = ctx.chat?.id;
+    if (!chatId) return;
     conversationHistory.length = 0;
     agent.clearMessages();
-    clearSession();
+    clearSession({ sessionKey: `tg-${chatId}` });
     await ctx.reply("Conversation context cleared.");
   });
 
@@ -271,6 +273,8 @@ export function createTelegramBot(agent: Agent): Bot {
     }
 
     log("info", `Telegram message from ${ctx.from?.id}: ${text.slice(0, 100)}${images?.length ? ` (+${images.length} image${images.length > 1 ? "s" : ""})` : ""}`);
+    const sessionKey = `tg-${ctx.chat?.id ?? ctx.from?.id ?? "unknown"}`;
+    agent.sessionId = sessionKey;
 
     conversationHistory.push({ role: "user", text, timestamp: Date.now() });
     trimHistory();
@@ -572,7 +576,7 @@ export function createTelegramBot(agent: Agent): Bot {
       trimHistory();
 
       updateTaskStatus(task.id, "completed", { response: responseText.slice(0, 500) });
-      saveSession(agent);
+      saveSession(agent, { sessionKey });
       await writeMemoryEvent(`Telegram conversation with user ${ctx.from?.id}: "${text.slice(0, 80)}"`);
     } catch (e: any) {
       if (editTimer) clearInterval(editTimer);

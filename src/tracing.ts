@@ -2,7 +2,6 @@ import { AgentWeaveConfig, traceTool, withSpan } from "agentweave";
 import {
   PROV_ACTIVITY_TYPE, ACTIVITY_AGENT_TURN,
   PROV_AGENT_ID, PROV_WAS_ASSOCIATED_WITH,
-  PROV_AGENT_TYPE, AGENT_TYPE_MAIN,
 } from "agentweave";
 import type { AgentTool } from "@mariozechner/pi-agent-core";
 import { log } from "./logger.js";
@@ -62,9 +61,21 @@ export function traceAgentTurn<T>(
     [PROV_ACTIVITY_TYPE]: ACTIVITY_AGENT_TURN,
     [PROV_AGENT_ID]: "max-v1",
     [PROV_WAS_ASSOCIATED_WITH]: "max-v1",
-    [PROV_AGENT_TYPE]: AGENT_TYPE_MAIN,
+    "prov.agent.type": "main",
     ...(meta?.sessionId ? { 'session.id': meta.sessionId, 'prov.session.id': meta.sessionId } : {}),
     ...(meta?.telegramMessageId ? { 'telegram.message_id': String(meta.telegramMessageId) } : {}),
     ...(meta?.chatId ? { 'telegram.chat_id': String(meta.chatId) } : {}),
   }, () => fn());
+}
+
+export function traceContextEvent<T>(
+  name: "context.pruning" | "context.compaction" | "context.brief_update",
+  attrs: Record<string, string | number | boolean | undefined>,
+  fn: () => T
+): T {
+  if (!AgentWeaveConfig.enabled) return fn();
+  const cleanAttrs = Object.fromEntries(
+    Object.entries(attrs).filter(([, value]) => value !== undefined)
+  ) as Record<string, string | number | boolean>;
+  return withSpan(name, cleanAttrs, fn as any) as T;
 }

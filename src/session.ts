@@ -2,11 +2,168 @@ import type { Agent } from "@mariozechner/pi-agent-core";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import { getState, setState } from "./task-journal.js";
 import { log } from "./logger.js";
+import { getAgentWeaveSession } from "./agentweave-context.js";
+import { traceContextEvent } from "./tracing.js";
 
 const SESSION_KEY = "session_messages";
 const MAX_TOOL_RESULT_CHARS = 2000; // truncate tool results to prevent session bloat
 const MAX_SESSION_MESSAGES = 20; // only save the most recent messages
-let saveTimer: ReturnType<typeof setTimeout> | null = null;
+const ACTIVE_BRIEF_MAX_CHARS = 2048;
+const ACTIVE_BRIEF_LIST_MAX = 8;
+const saveTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+export interface SessionOptions {
+  sessionKey?: string;
+}
+
+export interface SessionBrief {
+  brief_md: string;
+  last_user_req: string;
+  current_objective: string;
+  suggested_next: string[];
+  files_touched: string[];
+  open_blockers: string;
+  updated_at: number;
+}
+
+function normalizeSessionKey(sessionKey?: string): string {
+  return sessionKey || getAgentWeaveSession() || "max-main";
+}
+
+function scopedStateKey(prefix: string, sessionKey?: string): string {
+  return `${prefix}:${normalizeSessionKey(sessionKey)}`;
+}
+
+function truncateText(text: string, maxChars: number): string {
+  const compact = text.replace(/\s+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+  if (compact.length <= maxChars) return compact;
+  return `${compact.slice(0, Math.max(0, maxChars - 24)).trimEnd()}\n...[truncated]`;
+}
+
+function uniqueCapped(values: string[], max = ACTIVE_BRIEF_LIST_MAX): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const value of values) {
+    const trimmed = value.trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    out.push(trimmed);
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
+function extractText(msg: AgentMessage): string {
+  const m = msg as any;
+  if (m.role === "user") {
+    if (typeof m.content === "string") return m.content;
+    if (Array.isArray(m.content)) {
+      return m.content
+        .filter((c: any) => c.type === "text")
+        .map((c: any) => c.text)
+        .join("\n");
+    }
+  }
+  if ((m.role === "assistant" || m.role === "toolResult") && Array.isArray(m.content)) {
+    return m.content
+      .filter((c: any) => c.type === "text")
+      .map((c: any) => c.text)
+      .join("\n");
+  }
+  return "";
+}
+
+function extractFilesTouched(messages: AgentMessage[]): string[] {
+  const text = messages.map(extractText).join("\n");
+  const matches = text.match(/(?:\/[\w.-]+)+(?:\.[\w.-]+)?|(?:src|tests|docs|scripts|dist)\/[^\s'"`)]+/g) ?? [];
+  return uniqueCapped(matches.map((m) => m.replace(/[),.;:]+$/, "")));
+}
+
+export function capSessionBrief(brief: Omit<SessionBrief, "updated_at"> & Partial<Pick<SessionBrief, "updated_at">>): SessionBrief {
+  return {
+    brief_md: truncateText(brief.brief_md || "", ACTIVE_BRIEF_MAX_CHARS),
+    last_user_req: truncateText(brief.last_user_req || "", 500),
+    current_objective: truncateText(brief.current_objective || "", 300),
+    suggested_next: uniqueCapped((brief.suggested_next || []).map((v) => truncateText(v, 180)), 3),
+    files_touched: uniqueCapped(brief.files_touched || []),
+    open_blockers: truncateText(brief.open_blockers || "", 300),
+    updated_at: brief.updated_at || Date.now(),
+  };
+}
+
+export function getSessionBrief(sessionKey?: string): SessionBrief | null {
+  try {
+    const json = getState(scopedStateKey("session_brief", sessionKey));
+    if (!json) return null;
+    const parsed = JSON.parse(json);
+    if (!parsed || typeof parsed !== "object") return null;
+    return capSessionBrief({
+      brief_md: String(parsed.brief_md || ""),
+      last_user_req: String(parsed.last_user_req || ""),
+      current_objective: String(parsed.current_objective || ""),
+      suggested_next: Array.isArray(parsed.suggested_next) ? parsed.suggested_next.map(String) : [],
+      files_touched: Array.isArray(parsed.files_touched) ? parsed.files_touched.map(String) : [],
+      open_blockers: String(parsed.open_blockers || ""),
+      updated_at: typeof parsed.updated_at === "number" ? parsed.updated_at : Date.now(),
+    });
+  } catch (e: any) {
+    log("warn", `Failed to read session brief: ${e.message}`);
+    return null;
+  }
+}
+
+export function setSessionBrief(brief: Omit<SessionBrief, "updated_at"> & Partial<Pick<SessionBrief, "updated_at">>, sessionKey?: string): SessionBrief {
+  const key = normalizeSessionKey(sessionKey);
+  const capped = capSessionBrief({ ...brief, updated_at: Date.now() });
+  setState(scopedStateKey("session_brief", key), JSON.stringify(capped));
+  traceContextEvent("context.brief_update", {
+    "session.id": key,
+    "prov.session.id": key,
+    "context.brief_chars": capped.brief_md.length,
+    "context.brief_files": capped.files_touched.length,
+  }, () => undefined);
+  log("info", `Session brief updated for ${key} (${capped.brief_md.length} chars)`);
+  return capped;
+}
+
+export function buildSessionBrief(messages: AgentMessage[]): SessionBrief | null {
+  const latestUser = [...messages].reverse().find((msg) => (msg as any).role === "user");
+  if (!latestUser) return null;
+  const latestAssistant = [...messages].reverse().find((msg) => (msg as any).role === "assistant");
+  const lastUserReq = truncateText(extractText(latestUser), 500);
+  const assistantText = latestAssistant ? truncateText(extractText(latestAssistant), 900) : "";
+  const toolNames = uniqueCapped(messages
+    .filter((msg) => (msg as any).role === "toolResult" && (msg as any).toolName)
+    .map((msg) => String((msg as any).toolName)));
+  const filesTouched = extractFilesTouched(messages);
+  const briefLines = [
+    lastUserReq ? `Latest request: ${lastUserReq}` : "",
+    assistantText ? `Latest response/outcome: ${assistantText}` : "",
+    toolNames.length > 0 ? `Recent tools: ${toolNames.join(", ")}` : "",
+    filesTouched.length > 0 ? `Files touched: ${filesTouched.join(", ")}` : "",
+  ].filter(Boolean);
+  if (briefLines.length === 0) return null;
+  return capSessionBrief({
+    brief_md: briefLines.join("\n"),
+    last_user_req: lastUserReq,
+    current_objective: lastUserReq,
+    suggested_next: [],
+    files_touched: filesTouched,
+    open_blockers: "",
+  });
+}
+
+export function updateSessionBriefFromMessages(messages: AgentMessage[], sessionKey?: string): SessionBrief | null {
+  const key = normalizeSessionKey(sessionKey);
+  try {
+    const brief = buildSessionBrief(messages);
+    if (!brief) return null;
+    return setSessionBrief(brief, key);
+  } catch (e: any) {
+    log("warn", `Session brief update failed for ${key}: ${e.message}`);
+    return null;
+  }
+}
 
 /**
  * Truncate large tool results, strip thinking blocks, and limit message count
@@ -53,19 +210,25 @@ function trimForStorage(messages: AgentMessage[]): AgentMessage[] {
 /**
  * Save agent messages to SQLite (debounced 500ms).
  */
-export function saveSession(agent: Agent): void {
-  if (saveTimer) clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
+export function saveSession(agent: Agent, options: SessionOptions = {}): void {
+  const sessionKey = normalizeSessionKey(options.sessionKey);
+  const existingTimer = saveTimers.get(sessionKey);
+  if (existingTimer) clearTimeout(existingTimer);
+  const timer = setTimeout(() => {
+    saveTimers.delete(sessionKey);
     try {
       const { messages: repaired } = repairErroredAssistantTurns(agent.state.messages);
       const trimmed = trimForStorage(repaired);
       const json = JSON.stringify(trimmed);
+      setState(scopedStateKey(SESSION_KEY, sessionKey), json);
       setState(SESSION_KEY, json);
-      log("info", `Session saved (${trimmed.length} of ${agent.state.messages.length} messages)`);
+      updateSessionBriefFromMessages(trimmed, sessionKey);
+      log("info", `Session saved for ${sessionKey} (${trimmed.length} of ${agent.state.messages.length} messages)`);
     } catch (e: any) {
       log("error", `Failed to save session: ${e.message}`);
     }
   }, 500);
+  saveTimers.set(sessionKey, timer);
 }
 
 /**
@@ -97,9 +260,10 @@ function repairErroredAssistantTurns(messages: AgentMessage[]): { messages: Agen
  * Restore agent messages from SQLite.
  * Returns the number of messages restored.
  */
-export function restoreSession(agent: Agent): number {
+export function restoreSession(agent: Agent, options: SessionOptions = {}): number {
   try {
-    const json = getState(SESSION_KEY);
+    const sessionKey = normalizeSessionKey(options.sessionKey);
+    const json = getState(scopedStateKey(SESSION_KEY, sessionKey)) ?? getState(SESSION_KEY);
     if (!json) return 0;
 
     const parsed = JSON.parse(json);
@@ -108,9 +272,9 @@ export function restoreSession(agent: Agent): number {
     const { messages, repaired } = repairErroredAssistantTurns(parsed);
     agent.state.messages = messages;
     if (repaired > 0) {
-      log("info", `Session restored (${messages.length} messages, repaired ${repaired} errored assistant turns)`);
+      log("info", `Session restored for ${sessionKey} (${messages.length} messages, repaired ${repaired} errored assistant turns)`);
     } else {
-      log("info", `Session restored (${messages.length} messages)`);
+      log("info", `Session restored for ${sessionKey} (${messages.length} messages)`);
     }
     return messages.length;
   } catch (e: any) {
@@ -122,10 +286,20 @@ export function restoreSession(agent: Agent): number {
 /**
  * Clear saved session from SQLite.
  */
-export function clearSession(): void {
+export function clearSession(options: SessionOptions = {}): void {
   try {
-    setState(SESSION_KEY, "[]");
-    log("info", "Session cleared");
+    const sessionKey = normalizeSessionKey(options.sessionKey);
+    setState(scopedStateKey(SESSION_KEY, sessionKey), "[]");
+    setState(scopedStateKey("session_brief", sessionKey), JSON.stringify(capSessionBrief({
+      brief_md: "",
+      last_user_req: "",
+      current_objective: "",
+      suggested_next: [],
+      files_touched: [],
+      open_blockers: "",
+    })));
+    if (sessionKey === "max-main") setState(SESSION_KEY, "[]");
+    log("info", `Session cleared for ${sessionKey}`);
   } catch (e: any) {
     log("error", `Failed to clear session: ${e.message}`);
   }
