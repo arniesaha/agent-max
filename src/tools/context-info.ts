@@ -15,9 +15,10 @@ export function createContextInfoTool(agent: Agent): AgentTool {
       const lines = [
         `Context window: ${(stats.contextWindow / 1000).toFixed(0)}K tokens`,
         `Estimated usage: ~${(stats.totalTokens / 1000).toFixed(1)}K tokens (${stats.usagePercent}%)`,
-        `Compact threshold: ${(stats.compactThreshold / 1000).toFixed(0)}K tokens (80%)`,
+        `Compact threshold: ${(stats.compactThreshold / 1000).toFixed(0)}K tokens`,
         `Messages: ${stats.messageCount}`,
         `Compactions so far: ${stats.compactions}`,
+        `Pruned tool result stubs: ${stats.prunedToolResults}`,
         `Model: ${agent.state.model.id}`,
         `Thinking: ${agent.state.thinkingLevel}`,
       ];
