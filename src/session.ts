@@ -114,10 +114,9 @@ function repairErroredAssistantTurns(messages: AgentMessage[]): { messages: Agen
 }
 
 /**
- * Restore agent messages from SQLite.
- * Returns the number of messages restored.
+ * Load session messages from SQLite without mutating an Agent instance.
  */
-export function restoreSession(agent: Agent, ctx?: SessionContext): number {
+export function loadSessionMessages(ctx?: SessionContext): AgentMessage[] {
   const sessionContext = contextOrActive(ctx);
   const stateKey = storageKeyForSession(sessionContext);
   try {
@@ -126,28 +125,35 @@ export function restoreSession(agent: Agent, ctx?: SessionContext): number {
       json = getState(LEGACY_SESSION_KEY);
     }
     if (!json) {
-      agent.state.messages = [];
-      return 0;
+      return [];
     }
 
     const parsed = JSON.parse(json);
     if (!Array.isArray(parsed) || parsed.length === 0) {
-      agent.state.messages = [];
-      return 0;
+      return [];
     }
 
     const { messages, repaired } = repairErroredAssistantTurns(parsed);
-    agent.state.messages = messages;
     if (repaired > 0) {
-      log("info", `Session restored for ${sessionContext.sessionKey} (${messages.length} messages, repaired ${repaired} errored assistant turns)`);
+      log("info", `Session loaded for ${sessionContext.sessionKey} (${messages.length} messages, repaired ${repaired} errored assistant turns)`);
     } else {
-      log("info", `Session restored for ${sessionContext.sessionKey} (${messages.length} messages)`);
+      log("info", `Session loaded for ${sessionContext.sessionKey} (${messages.length} messages)`);
     }
-    return messages.length;
+    return messages;
   } catch (e: any) {
-    log("error", `Failed to restore session ${sessionContext.sessionKey}: ${e.message}`);
-    return 0;
+    log("error", `Failed to load session ${sessionContext.sessionKey}: ${e.message}`);
+    return [];
   }
+}
+
+/**
+ * Restore agent messages from SQLite.
+ * Returns the number of messages restored.
+ */
+export function restoreSession(agent: Agent, ctx?: SessionContext): number {
+  const messages = loadSessionMessages(ctx);
+  agent.state.messages = messages;
+  return messages.length;
 }
 
 /**

@@ -34,6 +34,7 @@ jest.unstable_mockModule("../src/logger.js", () => ({ log: jest.fn() }));
 jest.unstable_mockModule("../src/session.js", () => ({
   saveSession: jest.fn(),
   restoreSession: jest.fn(),
+  loadSessionMessages: jest.fn().mockReturnValue([]),
   loadSession: jest.fn().mockReturnValue(null),
 }));
 jest.unstable_mockModule("../src/agentweave-context.js", () => ({

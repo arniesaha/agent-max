@@ -15,7 +15,7 @@ import {
 } from "./task-journal.js";
 import { makeA2ASessionContext, makeTuiSessionContext, withSessionContext, type SessionContext } from "./agentweave-context.js";
 import { log } from "./logger.js";
-import { restoreSession, saveSession } from "./session.js";
+import { loadSessionMessages, restoreSession, saveSession } from "./session.js";
 import { extractAssistantTextFromTurn, extractErrorFromTurn } from "./response.js";
 import type { WorkerProgressEvent } from "./worker.js";
 import { relayTaskUpdateToTelegram, relayJobCompletionToTelegram } from "./telegram-notify.js";
@@ -90,8 +90,8 @@ async function registerAgentWeaveSession(ctx: SessionContext): Promise<void> {
   }
 }
 
-function messagesForTui(agent: Agent): { role: string; text: string }[] {
-  return agent.state.messages
+function messagesForTui(messages: unknown[]): { role: string; text: string }[] {
+  return messages
     .map((msg: any) => {
       const text = Array.isArray(msg.content)
         ? msg.content
@@ -155,8 +155,8 @@ export function createA2AServer(agent: Agent): express.Express {
 
   app.get("/messages", authMiddleware, (_req, res) => {
     const sessionContext = makeTuiSessionContext();
-    restoreSession(agent, sessionContext);
-    res.json({ sessionId: sessionContext.sessionId, sessionKey: sessionContext.sessionKey, messages: messagesForTui(agent) });
+    const messages = loadSessionMessages(sessionContext);
+    res.json({ sessionId: sessionContext.sessionId, sessionKey: sessionContext.sessionKey, messages: messagesForTui(messages) });
   });
 
   app.post("/tasks", authMiddleware, async (req, res) => {
