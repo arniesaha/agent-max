@@ -55,7 +55,7 @@ export function traceTools(tools: AgentTool[]): AgentTool[] {
 export function traceAgentTurn<T>(
   name: string,
   fn: () => T | Promise<T>,
-  meta?: { sessionId?: string; telegramMessageId?: number; chatId?: number }
+  meta?: { sessionId?: string; telegramMessageId?: number; chatId?: number; latestInputPreview?: string }
 ): T | Promise<T> {
   if (!AgentWeaveConfig.enabled) return fn();
   return withSpan(`agent.${name}`, {
