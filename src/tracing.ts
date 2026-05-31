@@ -68,3 +68,33 @@ export function traceAgentTurn<T>(
     ...(meta?.chatId ? { 'telegram.chat_id': String(meta.chatId) } : {}),
   }, () => fn());
 }
+
+
+export interface ContextCompactionTraceMeta {
+  sessionKey?: string;
+  beforeTokens: number;
+  afterTokens: number;
+  beforeMessages: number;
+  afterMessages: number;
+  prunedToolResults: number;
+  compactedMessages: number;
+  compactionCount: number;
+}
+
+export function traceContextCompaction<T>(meta: ContextCompactionTraceMeta, fn: () => T): T | Promise<T> {
+  if (!AgentWeaveConfig.enabled) return fn();
+  return withSpan("context.compaction", {
+    [PROV_ACTIVITY_TYPE]: "context.compaction",
+    [PROV_AGENT_ID]: "max-v1",
+    [PROV_WAS_ASSOCIATED_WITH]: "max-v1",
+    [PROV_AGENT_TYPE]: AGENT_TYPE_MAIN,
+    ...(meta.sessionKey ? { "session.key": meta.sessionKey, "prov.session.key": meta.sessionKey } : {}),
+    "context.tokens.before": meta.beforeTokens,
+    "context.tokens.after": meta.afterTokens,
+    "context.messages.before": meta.beforeMessages,
+    "context.messages.after": meta.afterMessages,
+    "context.tool_results.pruned": meta.prunedToolResults,
+    "context.messages.compacted": meta.compactedMessages,
+    "context.compaction.count": meta.compactionCount,
+  }, fn);
+}

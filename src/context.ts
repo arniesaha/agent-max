@@ -2,6 +2,9 @@ import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import type { AssistantMessage, Message } from "@mariozechner/pi-ai";
 import { getModel, getEnvApiKey, streamSimple } from "@mariozechner/pi-ai";
 import { log } from "./logger.js";
+import { getSessionContext } from "./agentweave-context.js";
+import { getActiveBrief, getSessionSummary, setSessionSummary, type SessionActiveBrief } from "./session.js";
+import { traceContextCompaction } from "./tracing.js";
 
 /**
  * Context-sizing knobs.
@@ -36,23 +39,18 @@ function logConfigOnce(): void {
 }
 
 // How many user turns at the tail to keep tool-result bodies intact.
-// Older toolResults beyond this window are replaced with a 1-line stub.
-// This is the biggest in-session lever: a single gh-diff or browser-scrape
-// otherwise re-bills itself on every subsequent agent iteration.
 const FRESH_TURNS = Math.floor(Number(process.env.MAX_FRESH_TURNS || 4));
-const STALE_STUB_CHARS = 200; // keep a tiny prefix for continuity
+const STALE_STUB_CHARS = 200;
+const ACTIVE_BRIEF_MAX_AGE_MS = envNumber("MAX_ACTIVE_BRIEF_MAX_AGE_MS", 48 * 60 * 60 * 1000);
 
 /** Rough token estimate: ~4 chars per token for text, actual usage for assistant messages */
 function estimateMessageTokens(msg: AgentMessage): number {
   const m = msg as Message;
   if (m.role === "assistant") {
     const am = m as AssistantMessage;
-    // Use output tokens as the message size estimate (NOT totalTokens which
-    // includes input context and would make every assistant message appear as
-    // 800k+ tokens, triggering runaway compaction)
     if (am.usage?.output) return am.usage.output;
   }
-  // Estimate from content
+
   let chars = 0;
   if (m.role === "user") {
     if (typeof m.content === "string") {
@@ -60,7 +58,7 @@ function estimateMessageTokens(msg: AgentMessage): number {
     } else if (Array.isArray(m.content)) {
       for (const c of m.content) {
         if (c.type === "text") chars += c.text.length;
-        else if (c.type === "image") chars += 1000; // ~250 tokens per image
+        else if (c.type === "image") chars += 1000;
       }
     }
   } else if (m.role === "assistant") {
@@ -84,11 +82,29 @@ export interface ContextStats {
   compactThreshold: number;
   usagePercent: number;
   compactions: number;
+  prunedToolResults: number;
+  sessionKey?: string;
+}
+
+export interface TransformContextOptions {
+  sessionKey?: string;
+  includeActiveBrief?: boolean;
+  includeSessionSummary?: boolean;
+  reason?: "casual" | "long_running" | "post_compaction" | "manual";
+  disableLlmSummary?: boolean;
+  now?: number;
+}
+
+export interface RequestContextResult {
+  messages: AgentMessage[];
+  stats: ContextStats;
+  compacted: boolean;
+  compactedMessages: number;
 }
 
 let compactionCount = 0;
 
-export function getContextStats(messages: AgentMessage[]): ContextStats {
+export function getContextStats(messages: AgentMessage[], sessionKey?: string): ContextStats {
   const totalTokens = messages.reduce((sum, m) => sum + estimateMessageTokens(m), 0);
   return {
     totalTokens,
@@ -97,34 +113,27 @@ export function getContextStats(messages: AgentMessage[]): ContextStats {
     compactThreshold: TOKEN_LIMIT,
     usagePercent: Math.round((totalTokens / CONTEXT_WINDOW) * 100),
     compactions: compactionCount,
+    prunedToolResults: countPrunedToolResultStubs(messages),
+    ...(sessionKey ? { sessionKey } : {}),
   };
 }
 
-/**
- * Compact context by summarizing old messages into a single summary message.
- * Keeps the most recent messages intact.
- *
- * Strategy (inspired by Claude Code / Aider):
- * - When over threshold, take the oldest messages (leaving KEEP_RECENT)
- * - Extract key information: tool calls made, results, decisions, errors
- * - Replace with a single compact user message containing the summary
- */
-/**
- * Replace tool-result bodies older than the last `FRESH_TURNS` user turns with
- * a short stub. The result preserves the message structure (role, toolCallId,
- * isError) so tool_use ↔ tool_result pairing remains valid, but strips the
- * bulk of text content that would otherwise be re-sent to the model on every
- * subsequent iteration within the same session.
- *
- * Idempotent: a message whose content is already the stub marker is left alone.
- */
-export function pruneStaleToolResults(
-  messages: AgentMessage[],
-  freshTurns = FRESH_TURNS
-): AgentMessage[] {
-  if (freshTurns <= 0 || messages.length === 0) return messages;
+function countPrunedToolResultStubs(messages: AgentMessage[]): number {
+  return messages.filter((msg) => {
+    const m = msg as any;
+    return m.role === "toolResult" && Array.isArray(m.content) &&
+      m.content.some((c: any) => c.type === "text" && typeof c.text === "string" && c.text.includes("body pruned from context"));
+  }).length;
+}
 
-  // Identify the cut index: the index of the (freshTurns)th user message from the end.
+interface PruneResult {
+  messages: AgentMessage[];
+  prunedCount: number;
+}
+
+function pruneStaleToolResultsWithStats(messages: AgentMessage[], freshTurns = FRESH_TURNS): PruneResult {
+  if (freshTurns <= 0 || messages.length === 0) return { messages, prunedCount: 0 };
+
   let seen = 0;
   let cutIdx = 0;
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -136,179 +145,239 @@ export function pruneStaleToolResults(
       }
     }
   }
-  if (cutIdx <= 0) return messages; // nothing stale
+  if (cutIdx <= 0) return { messages, prunedCount: 0 };
 
   let changed = false;
+  let prunedCount = 0;
   const out = messages.map((msg, idx) => {
     if (idx >= cutIdx) return msg;
     const m = msg as any;
     if (m.role !== "toolResult") return msg;
     if (!Array.isArray(m.content)) return msg;
 
-    // Compute total text length; if already tiny, leave alone.
     let totalLen = 0;
     for (const c of m.content) {
       if (c.type === "text" && typeof c.text === "string") totalLen += c.text.length;
     }
-    if (totalLen <= STALE_STUB_CHARS * 2) return msg; // already small
+    if (totalLen <= STALE_STUB_CHARS * 2) return msg;
+
+    const firstText = m.content.find((c: any) => c.type === "text")?.text ?? "";
+    if (typeof firstText === "string" && firstText.includes("body pruned from context")) return msg;
 
     const name = m.toolName || "tool";
-    // Keep a short head prefix of the first text block (often contains path /
-    // status / counts) to preserve a breadcrumb for the model.
-    const firstText = m.content.find((c: any) => c.type === "text")?.text ?? "";
     const head = firstText.slice(0, STALE_STUB_CHARS).replace(/\s+/g, " ").trim();
     const stubText = `[${name} result — body pruned from context (${totalLen} chars). head: ${head}${head.length < firstText.length ? "…" : ""}]`;
     changed = true;
+    prunedCount++;
     return { ...m, content: [{ type: "text", text: stubText }] };
   });
 
-  return changed ? out : messages;
+  return { messages: changed ? out : messages, prunedCount };
 }
 
-export async function transformContext(messages: AgentMessage[]): Promise<AgentMessage[]> {
+/**
+ * Replace tool-result bodies older than the last `FRESH_TURNS` user turns with
+ * a short stub. This is request-context pruning only; durable history should be
+ * left to session storage policy rather than rewritten for one model call.
+ */
+export function pruneStaleToolResults(
+  messages: AgentMessage[],
+  freshTurns = FRESH_TURNS
+): AgentMessage[] {
+  return pruneStaleToolResultsWithStats(messages, freshTurns).messages;
+}
+
+function extractText(msg: AgentMessage): string {
+  const m = msg as Message;
+  if (m.role === "user") {
+    return typeof m.content === "string"
+      ? m.content
+      : m.content.filter((c) => c.type === "text").map((c) => (c as any).text).join(" ");
+  }
+  if (m.role === "assistant" || m.role === "toolResult") {
+    return m.content.filter((c) => c.type === "text").map((c) => (c as any).text).join(" ");
+  }
+  return "";
+}
+
+function buildHeuristicSummary(msgs: AgentMessage[]): string {
+  const parts: string[] = ["[Context summary — earlier conversation, not a new user request:]"];
+  for (const msg of msgs) {
+    const m = msg as Message;
+    if (m.role === "user") {
+      const text = extractText(msg);
+      if (text.length > 0) parts.push(`User: ${text.slice(0, 300)}${text.length > 300 ? "..." : ""}`);
+    } else if (m.role === "assistant") {
+      const texts = extractText(msg);
+      const toolCalls = m.content
+        .filter((c) => c.type === "toolCall")
+        .map((c) => (c as any).name)
+        .join(", ");
+      if (toolCalls) parts.push(`Assistant: [called: ${toolCalls}] ${texts.slice(0, 200)}${texts.length > 200 ? "..." : ""}`);
+      else if (texts.length > 0) parts.push(`Assistant: ${texts.slice(0, 300)}${texts.length > 300 ? "..." : ""}`);
+    } else if (m.role === "toolResult") {
+      const text = extractText(msg);
+      const status = (m as any).isError ? "ERROR" : "OK";
+      parts.push(`Tool ${(m as any).toolName} [${status}]: ${text.slice(0, 200)}${text.length > 200 ? "..." : ""}`);
+    }
+  }
+  return parts.join("\n");
+}
+
+async function buildLLMSummary(msgs: AgentMessage[]): Promise<string | null> {
+  try {
+    const defaultModel = process.env.DEFAULT_MODEL ?? "gemini-2.5-pro";
+    const provider = defaultModel.startsWith("claude") ? "anthropic" : "google";
+    const model = getModel(provider as any, defaultModel as any);
+    if (!model) return null;
+
+    const MAX_HISTORY_CHARS = 50_000;
+    let historyText = buildHeuristicSummary(msgs);
+    if (historyText.length > MAX_HISTORY_CHARS) historyText = historyText.slice(0, MAX_HISTORY_CHARS) + "\n[...truncated]";
+    const prompt = `Summarize the following conversation history concisely. Focus on: decisions made, tools called and key outcomes, errors encountered, current state of any ongoing work, and any important context needed to continue. Be specific and include relevant values, paths, and statuses.\n\n${historyText}`;
+
+    const apiKey = getEnvApiKey(provider as any);
+    const stream = streamSimple(
+      model,
+      { messages: [{ role: "user", content: prompt, timestamp: Date.now() }] },
+      { apiKey }
+    );
+
+    const LLM_TIMEOUT_MS = 30_000;
+    const consumeStream = async (): Promise<string> => {
+      let summary = "";
+      for await (const event of stream) {
+        if (event.type === "text_delta") summary += event.delta;
+        else if (event.type === "done") break;
+        else if (event.type === "error") throw new Error(event.error?.errorMessage ?? "LLM compaction error");
+      }
+      return summary;
+    };
+    const timeout = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("LLM compaction timed out after 30s")), LLM_TIMEOUT_MS)
+    );
+    const summary = await Promise.race([consumeStream(), timeout]);
+
+    return summary.trim() || null;
+  } catch (err) {
+    log("warn", `LLM compaction summary failed, falling back to heuristic: ${err}`);
+    return null;
+  }
+}
+
+function summaryMessage(summary: string, timestamp: string): AgentMessage {
+  return {
+    role: "user",
+    content: `[CONTEXT SUMMARY — compacted at ${timestamp}; not a new user request]\n\n${summary}`,
+    timestamp: Date.now(),
+  } as AgentMessage;
+}
+
+function activeBriefMessage(brief: SessionActiveBrief): AgentMessage {
+  const lines = ["[ACTIVE SESSION BRIEF — continuity context, not a new user request]", brief.brief_md];
+  if (brief.last_user_req) lines.push(`Last user request: ${brief.last_user_req}`);
+  if (brief.current_objective) lines.push(`Current objective: ${brief.current_objective}`);
+  if (brief.suggested_next?.length) lines.push(`Suggested next: ${brief.suggested_next.join("; ")}`);
+  if (brief.files_touched?.length) lines.push(`Files touched: ${brief.files_touched.join(", ")}`);
+  if (brief.open_blockers) lines.push(`Open blockers: ${brief.open_blockers}`);
+  return { role: "user", content: lines.filter(Boolean).join("\n"), timestamp: Date.now() } as AgentMessage;
+}
+
+function shouldIncludeActiveBrief(brief: SessionActiveBrief | undefined, options: TransformContextOptions): brief is SessionActiveBrief {
+  if (!brief) return false;
+  const useful = Boolean(brief.brief_md || brief.current_objective || brief.open_blockers || brief.files_touched?.length);
+  if (!useful) return false;
+  const ageMs = (options.now ?? Date.now()) - (brief.updated_at ?? 0);
+  if (ageMs > ACTIVE_BRIEF_MAX_AGE_MS) return false;
+  return options.includeActiveBrief === true || options.reason === "long_running" || options.reason === "post_compaction" || options.reason === "manual";
+}
+
+export async function buildRequestContext(messages: AgentMessage[], options: TransformContextOptions = {}): Promise<RequestContextResult> {
   logConfigOnce();
 
-  // Cheap in-session pruning first — runs every turn, strips old toolResult
-  // bodies so a long merge/debug session doesn't re-bill huge diffs forever.
-  messages = pruneStaleToolResults(messages);
+  const beforeMessages = messages.length;
+  const beforeTokens = messages.reduce((sum, m) => sum + estimateMessageTokens(m), 0);
+  const pruned = pruneStaleToolResultsWithStats(messages);
+  messages = pruned.messages;
 
-  const totalTokens = messages.reduce((sum, m) => sum + estimateMessageTokens(m), 0);
+  const storedSummary = options.sessionKey && options.includeSessionSummary !== false ? getSessionSummary(options.sessionKey) : undefined;
+  const storedSummaryMessage = storedSummary ? summaryMessage(storedSummary, "stored") : undefined;
+  const activeBrief = options.sessionKey ? getActiveBrief(options.sessionKey) : undefined;
+  const includeBriefBeforeCompaction = shouldIncludeActiveBrief(activeBrief, options);
+
+  let totalTokens = messages.reduce((sum, m) => sum + estimateMessageTokens(m), 0);
+  if (storedSummaryMessage) totalTokens += estimateMessageTokens(storedSummaryMessage);
+  if (includeBriefBeforeCompaction) totalTokens += estimateMessageTokens(activeBriefMessage(activeBrief));
 
   if (totalTokens <= TOKEN_LIMIT) {
-    return messages;
+    const prefix: AgentMessage[] = [];
+    if (storedSummaryMessage) prefix.push(storedSummaryMessage);
+    if (includeBriefBeforeCompaction) prefix.push(activeBriefMessage(activeBrief));
+    const out = prefix.length > 0 ? [...prefix, ...messages] : messages;
+    return {
+      messages: out,
+      stats: getContextStats(out, options.sessionKey),
+      compacted: false,
+      compactedMessages: 0,
+    };
   }
 
-  log("info", `Context compaction triggered: ${totalTokens} tokens > ${TOKEN_LIMIT} threshold (${messages.length} messages)`);
+  log("info", `Context compaction triggered: ${totalTokens} tokens > ${TOKEN_LIMIT} threshold (${messages.length} messages, session=${options.sessionKey ?? "unknown"})`);
 
-  // Find how many messages to compact — keep removing from front until under 50% of window
   const targetTokens = Math.floor(CONTEXT_WINDOW * 0.5);
   let keepFrom = messages.length - KEEP_RECENT;
-
-  // Make sure we keep at least KEEP_RECENT
   if (keepFrom < 1) keepFrom = 1;
 
-  // Walk backwards from keepFrom to find a good cut point under target
   let keptTokens = 0;
-  for (let i = messages.length - 1; i >= keepFrom; i--) {
-    keptTokens += estimateMessageTokens(messages[i]);
-  }
-
-  // If still over target, move keepFrom forward
+  for (let i = messages.length - 1; i >= keepFrom; i--) keptTokens += estimateMessageTokens(messages[i]);
   while (keepFrom < messages.length - KEEP_RECENT && keptTokens > targetTokens) {
     keepFrom++;
     keptTokens -= estimateMessageTokens(messages[keepFrom - 1]);
   }
-
-  // Ensure toKeep starts at a user message boundary — orphaned toolResult or
-  // assistant messages without their preceding context break model APIs.
-  while (keepFrom < messages.length && (messages[keepFrom] as Message).role !== "user") {
-    keepFrom++;
-  }
-  // If we couldn't find a user message, keep at least the last message
+  while (keepFrom < messages.length && (messages[keepFrom] as Message).role !== "user") keepFrom++;
   if (keepFrom >= messages.length) keepFrom = messages.length - 1;
 
   const toCompact = messages.slice(0, keepFrom);
   const toKeep = messages.slice(keepFrom);
-
-  if (toCompact.length === 0) return messages;
-
-  // Build heuristic summary as fallback
-  function buildHeuristicSummary(msgs: AgentMessage[]): string {
-    const parts: string[] = ["[Context compacted — summary of earlier conversation:]"];
-    for (const msg of msgs) {
-      const m = msg as Message;
-      if (m.role === "user") {
-        const text = typeof m.content === "string"
-          ? m.content
-          : m.content.filter(c => c.type === "text").map(c => (c as any).text).join(" ");
-        if (text.length > 0) {
-          parts.push(`User: ${text.slice(0, 300)}${text.length > 300 ? "..." : ""}`);
-        }
-      } else if (m.role === "assistant") {
-        const texts = m.content
-          .filter(c => c.type === "text")
-          .map(c => (c as any).text)
-          .join(" ");
-        const toolCalls = m.content
-          .filter(c => c.type === "toolCall")
-          .map(c => (c as any).name)
-          .join(", ");
-        if (toolCalls) {
-          parts.push(`Assistant: [called: ${toolCalls}] ${texts.slice(0, 200)}${texts.length > 200 ? "..." : ""}`);
-        } else if (texts.length > 0) {
-          parts.push(`Assistant: ${texts.slice(0, 300)}${texts.length > 300 ? "..." : ""}`);
-        }
-      } else if (m.role === "toolResult") {
-        const text = m.content.filter(c => c.type === "text").map(c => (c as any).text).join(" ");
-        const status = (m as any).isError ? "ERROR" : "OK";
-        parts.push(`Tool ${(m as any).toolName} [${status}]: ${text.slice(0, 200)}${text.length > 200 ? "..." : ""}`);
-      }
-    }
-    return parts.join("\n");
-  }
-
-  // Attempt LLM-generated summary
-  async function buildLLMSummary(msgs: AgentMessage[]): Promise<string | null> {
-    try {
-      const defaultModel = process.env.DEFAULT_MODEL ?? "gemini-2.5-pro";
-      const provider = defaultModel.startsWith("claude") ? "anthropic" : "google";
-      const model = getModel(provider as any, defaultModel as any);
-      if (!model) return null;
-
-      const MAX_HISTORY_CHARS = 50_000;
-      let historyText = buildHeuristicSummary(msgs);
-      if (historyText.length > MAX_HISTORY_CHARS) {
-        historyText = historyText.slice(0, MAX_HISTORY_CHARS) + "\n[...truncated]";
-      }
-      const prompt = `Summarize the following conversation history concisely. Focus on: decisions made, tools called and key outcomes, errors encountered, current state of any ongoing work, and any important context needed to continue. Be specific and include relevant values, paths, and statuses.\n\n${historyText}`;
-
-      const apiKey = getEnvApiKey(provider as any);
-      const stream = streamSimple(
-        model,
-        { messages: [{ role: "user", content: prompt, timestamp: Date.now() }] },
-        { apiKey }
-      );
-
-      const LLM_TIMEOUT_MS = 30_000;
-      const consumeStream = async (): Promise<string> => {
-        let summary = "";
-        for await (const event of stream) {
-          if (event.type === "text_delta") {
-            summary += event.delta;
-          } else if (event.type === "done") {
-            break;
-          } else if (event.type === "error") {
-            throw new Error(event.error?.errorMessage ?? "LLM compaction error");
-          }
-        }
-        return summary;
-      };
-      const timeout = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("LLM compaction timed out after 30s")), LLM_TIMEOUT_MS)
-      );
-      const summary = await Promise.race([consumeStream(), timeout]);
-
-      return summary.trim() || null;
-    } catch (err) {
-      log("warn", `LLM compaction summary failed, falling back to heuristic: ${err}`);
-      return null;
-    }
+  if (toCompact.length === 0) {
+    return { messages, stats: getContextStats(messages, options.sessionKey), compacted: false, compactedMessages: 0 };
   }
 
   const timestamp = new Date().toISOString();
-  const llmSummary = await buildLLMSummary(toCompact);
-  const summaryText = llmSummary
-    ? `[CONTEXT SUMMARY — compacted at ${timestamp}]\n\n${llmSummary}`
-    : buildHeuristicSummary(toCompact);
-  const summaryMessage: AgentMessage = {
-    role: "user",
-    content: summaryText,
-    timestamp: Date.now(),
-  };
+  const llmSummary = options.disableLlmSummary ? null : await buildLLMSummary(toCompact);
+  const summaryText = llmSummary ?? buildHeuristicSummary(toCompact);
+  if (options.sessionKey) setSessionSummary(options.sessionKey, summaryText);
 
   compactionCount++;
-  const newTokens = toKeep.reduce((sum, m) => sum + estimateMessageTokens(m), 0) + estimateMessageTokens(summaryMessage);
-  log("info", `Context compacted: ${toCompact.length} messages → summary. ${messages.length} → ${toKeep.length + 1} messages. ${totalTokens} → ~${newTokens} tokens. Compaction #${compactionCount}`);
+  const summary = summaryMessage(summaryText, timestamp);
+  const postCompactionBrief = shouldIncludeActiveBrief(activeBrief, { ...options, reason: options.reason ?? "post_compaction" })
+    ? activeBriefMessage(activeBrief)
+    : undefined;
+  const out = postCompactionBrief ? [summary, postCompactionBrief, ...toKeep] : [summary, ...toKeep];
+  const afterTokens = out.reduce((sum, m) => sum + estimateMessageTokens(m), 0);
 
-  return [summaryMessage, ...toKeep];
+  traceContextCompaction({
+    sessionKey: options.sessionKey,
+    beforeTokens,
+    afterTokens,
+    beforeMessages,
+    afterMessages: out.length,
+    prunedToolResults: pruned.prunedCount,
+    compactedMessages: toCompact.length,
+    compactionCount,
+  }, () => {
+    log("info", `Context compacted: ${toCompact.length} messages → session summary. ${beforeMessages} → ${out.length} messages. ${beforeTokens} → ~${afterTokens} tokens. Compaction #${compactionCount} session=${options.sessionKey ?? "unknown"}`);
+  });
+
+  return {
+    messages: out,
+    stats: getContextStats(out, options.sessionKey),
+    compacted: true,
+    compactedMessages: toCompact.length,
+  };
+}
+
+export async function transformContext(messages: AgentMessage[]): Promise<AgentMessage[]> {
+  const result = await buildRequestContext(messages, { sessionKey: getSessionContext().sessionKey });
+  return result.messages;
 }
