@@ -24,12 +24,15 @@ jest.unstable_mockModule("../src/task-journal.js", () => ({
 jest.unstable_mockModule("../src/logger.js", () => ({ log: jest.fn() }));
 jest.unstable_mockModule("../src/session.js", () => ({
   saveSession: jest.fn(),
+  restoreSession: jest.fn(),
   loadSession: jest.fn().mockReturnValue(null),
 }));
 jest.unstable_mockModule("../src/agentweave-context.js", () => ({
   setAgentWeaveSession: jest.fn(),
   resetAgentWeaveSession: jest.fn(),
   getAgentWeaveSession: jest.fn().mockReturnValue("max-main"),
+  withSessionContext: jest.fn((_ctx, fn: any) => fn()),
+  getSessionContext: jest.fn().mockReturnValue({ sessionKey: "max:main", sessionId: "max-main", surface: "main" }),
 }));
 jest.unstable_mockModule("../src/response.js", () => ({
   extractAssistantTextFromTurn: jest.fn().mockReturnValue(""),

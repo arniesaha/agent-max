@@ -33,12 +33,15 @@ jest.unstable_mockModule("../src/task-journal.js", () => ({
 jest.unstable_mockModule("../src/logger.js", () => ({ log: jest.fn() }));
 jest.unstable_mockModule("../src/session.js", () => ({
   saveSession: jest.fn(),
+  restoreSession: jest.fn(),
   loadSession: jest.fn().mockReturnValue(null),
 }));
 jest.unstable_mockModule("../src/agentweave-context.js", () => ({
   setAgentWeaveSession: jest.fn(),
   resetAgentWeaveSession: jest.fn(),
   getAgentWeaveSession: jest.fn().mockReturnValue("max-main"),
+  withSessionContext: jest.fn((_ctx, fn: any) => fn()),
+  getSessionContext: jest.fn().mockReturnValue({ sessionKey: "max:main", sessionId: "max-main", surface: "main" }),
 }));
 jest.unstable_mockModule("../src/response.js", () => ({
   extractAssistantTextFromTurn: jest.fn().mockReturnValue(""),
@@ -60,6 +63,8 @@ const SECRET = "test-trace-secret";
 process.env.A2A_SHARED_SECRET = SECRET;
 
 const { createA2AServer } = await import("../src/a2a-server.js");
+const { Worker } = await import("worker_threads");
+const { saveSession, restoreSession } = await import("../src/session.js");
 
 function makeAgent() {
   return {
@@ -196,5 +201,57 @@ describe("POST /tasks — traceparent HTTP acceptance", () => {
       body: taskBody("req-5"),
     });
     expect(res.body.result?.status?.state).toBe("working");
+  });
+
+  it("passes isolated session context to async A2A workers without saving the shared agent", async () => {
+    (Worker as jest.Mock).mockClear();
+    (saveSession as jest.Mock).mockClear();
+    const app = createA2AServer(makeAgent());
+    const res = await callEndpoint(app, "POST", "/tasks", {
+      auth: `Bearer ${SECRET}`,
+      headers: {
+        "x-agentweave-parent-session-id": "nix-session-123",
+        "x-agentweave-delegated-session-id": "max-from-nix-456",
+        "x-agentweave-agent-id": "nix-v1",
+        "x-agentweave-task-label": "delegation-from-nix",
+      },
+      body: taskBody("req-worker"),
+    });
+
+    expect(res.status).toBe(202);
+    expect(saveSession).not.toHaveBeenCalled();
+    const workerOptions = (Worker as jest.Mock).mock.calls[0][1] as any;
+    expect(workerOptions.workerData).toMatchObject({
+      taskId: "task-001",
+      text: "test task",
+      parentSessionId: "nix-session-123",
+      delegatedSessionId: "max-from-nix-456",
+      callerAgentId: "nix-v1",
+      taskLabel: "delegation-from-nix",
+    });
+  });
+
+  it("restores and saves only the sync A2A task bucket", async () => {
+    (saveSession as jest.Mock).mockClear();
+    (restoreSession as jest.Mock).mockClear();
+    const agent = makeAgent();
+    agent.prompt = jest.fn(async () => {
+      agent.state.messages = [{ role: "user", content: "test task" }, { role: "assistant", content: [{ type: "text", text: "ok" }] }];
+    });
+    const app = createA2AServer(agent);
+    const res = await callEndpoint(app, "POST", "/tasks?sync=true", {
+      auth: `Bearer ${SECRET}`,
+      headers: {
+        "x-agentweave-parent-session-id": "nix-session-123",
+        "x-agentweave-delegated-session-id": "max-from-nix-789",
+        "x-agentweave-agent-id": "nix-v1",
+        "x-agentweave-task-label": "sync-from-nix",
+      },
+      body: taskBody("req-sync"),
+    });
+
+    expect(res.status).toBe(200);
+    expect(restoreSession).toHaveBeenCalledWith(agent, "a2a:task-001");
+    expect(saveSession).toHaveBeenCalledWith(agent, "a2a:task-001");
   });
 });

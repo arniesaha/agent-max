@@ -2,11 +2,33 @@ import type { Agent } from "@mariozechner/pi-agent-core";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import { getState, setState } from "./task-journal.js";
 import { log } from "./logger.js";
+import { MAIN_SESSION_KEY } from "./session-context.js";
 
-const SESSION_KEY = "session_messages";
+const LEGACY_SESSION_KEY = "session_messages";
 const MAX_TOOL_RESULT_CHARS = 2000; // truncate tool results to prevent session bloat
 const MAX_SESSION_MESSAGES = 20; // only save the most recent messages
-let saveTimer: ReturnType<typeof setTimeout> | null = null;
+const saveTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+export function sessionStorageKey(sessionKey: string = MAIN_SESSION_KEY): string {
+  return `session_messages:${sessionKey}`;
+}
+
+function loadSessionJson(sessionKey: string): string | undefined {
+  const scopedKey = sessionStorageKey(sessionKey);
+  const scoped = getState(scopedKey);
+  if (scoped !== undefined) return scoped;
+
+  if (sessionKey === MAIN_SESSION_KEY) {
+    const legacy = getState(LEGACY_SESSION_KEY);
+    if (legacy !== undefined) {
+      setState(scopedKey, legacy);
+      log("info", `Migrated legacy ${LEGACY_SESSION_KEY} to ${scopedKey}`);
+    }
+    return legacy;
+  }
+
+  return undefined;
+}
 
 /**
  * Truncate large tool results, strip thinking blocks, and limit message count
@@ -14,7 +36,6 @@ let saveTimer: ReturnType<typeof setTimeout> | null = null;
  * so restored sessions produce valid API requests.
  */
 function trimForStorage(messages: AgentMessage[]): AgentMessage[] {
-  // Find a starting point within the last MAX_SESSION_MESSAGES that begins with a user message
   let startIdx = Math.max(0, messages.length - MAX_SESSION_MESSAGES);
   while (startIdx < messages.length && (messages[startIdx] as any).role !== "user") {
     startIdx++;
@@ -36,12 +57,9 @@ function trimForStorage(messages: AgentMessage[]): AgentMessage[] {
       });
       return { ...m, content: trimmedContent };
     }
-    // Strip thinking blocks entirely — they contain signatures that break
-    // when truncated, and the model doesn't need them for continuity.
     if (m.role === "assistant" && Array.isArray(m.content)) {
       const filtered = m.content.filter((c: any) => c.type !== "thinking");
       if (filtered.length === 0) {
-        // Thinking-only response — replace with a minimal text block
         return { ...m, content: [{ type: "text", text: "(thinking)" }] };
       }
       return { ...m, content: filtered };
@@ -53,29 +71,28 @@ function trimForStorage(messages: AgentMessage[]): AgentMessage[] {
 /**
  * Save agent messages to SQLite (debounced 500ms).
  */
-export function saveSession(agent: Agent): void {
-  if (saveTimer) clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
+export function saveSession(agent: Agent, sessionKey: string = MAIN_SESSION_KEY): void {
+  const existing = saveTimers.get(sessionKey);
+  if (existing) clearTimeout(existing);
+  const timer = setTimeout(() => {
     try {
       const { messages: repaired } = repairErroredAssistantTurns(agent.state.messages);
       const trimmed = trimForStorage(repaired);
       const json = JSON.stringify(trimmed);
-      setState(SESSION_KEY, json);
-      log("info", `Session saved (${trimmed.length} of ${agent.state.messages.length} messages)`);
+      setState(sessionStorageKey(sessionKey), json);
+      log("info", `Session ${sessionKey} saved (${trimmed.length} of ${agent.state.messages.length} messages)`);
     } catch (e: any) {
-      log("error", `Failed to save session: ${e.message}`);
+      log("error", `Failed to save session ${sessionKey}: ${e.message}`);
+    } finally {
+      saveTimers.delete(sessionKey);
     }
   }, 500);
+  saveTimers.set(sessionKey, timer);
 }
 
 /**
  * Rewrite assistant messages whose stopReason is "error"/"aborted" but whose
- * content is actually non-empty. This undoes damage from a prior mux regression
- * that passed Anthropic stop_reason values (e.g. "end_turn") through as
- * OpenAI finish_reason, causing pi-ai's mapStopReason to throw after the text
- * had already streamed. The assistant message was persisted with valid content
- * but stopReason="error", which transform-messages.js then dropped on every
- * subsequent turn — producing the +1/turn context bleed.
+ * content is actually non-empty.
  */
 function repairErroredAssistantTurns(messages: AgentMessage[]): { messages: AgentMessage[]; repaired: number } {
   let repaired = 0;
@@ -97,24 +114,31 @@ function repairErroredAssistantTurns(messages: AgentMessage[]): { messages: Agen
  * Restore agent messages from SQLite.
  * Returns the number of messages restored.
  */
-export function restoreSession(agent: Agent): number {
+export function restoreSession(agent: Agent, sessionKey: string = MAIN_SESSION_KEY): number {
   try {
-    const json = getState(SESSION_KEY);
-    if (!json) return 0;
+    const json = loadSessionJson(sessionKey);
+    if (!json) {
+      agent.state.messages = [];
+      return 0;
+    }
 
     const parsed = JSON.parse(json);
-    if (!Array.isArray(parsed) || parsed.length === 0) return 0;
+    if (!Array.isArray(parsed) || parsed.length === 0) {
+      agent.state.messages = [];
+      return 0;
+    }
 
     const { messages, repaired } = repairErroredAssistantTurns(parsed);
     agent.state.messages = messages;
     if (repaired > 0) {
-      log("info", `Session restored (${messages.length} messages, repaired ${repaired} errored assistant turns)`);
+      log("info", `Session ${sessionKey} restored (${messages.length} messages, repaired ${repaired} errored assistant turns)`);
     } else {
-      log("info", `Session restored (${messages.length} messages)`);
+      log("info", `Session ${sessionKey} restored (${messages.length} messages)`);
     }
     return messages.length;
   } catch (e: any) {
-    log("error", `Failed to restore session: ${e.message}`);
+    log("error", `Failed to restore session ${sessionKey}: ${e.message}`);
+    agent.state.messages = [];
     return 0;
   }
 }
@@ -122,11 +146,14 @@ export function restoreSession(agent: Agent): number {
 /**
  * Clear saved session from SQLite.
  */
-export function clearSession(): void {
+export function clearSession(sessionKey: string = MAIN_SESSION_KEY): void {
   try {
-    setState(SESSION_KEY, "[]");
-    log("info", "Session cleared");
+    const existing = saveTimers.get(sessionKey);
+    if (existing) clearTimeout(existing);
+    saveTimers.delete(sessionKey);
+    setState(sessionStorageKey(sessionKey), "[]");
+    log("info", `Session ${sessionKey} cleared`);
   } catch (e: any) {
-    log("error", `Failed to clear session: ${e.message}`);
+    log("error", `Failed to clear session ${sessionKey}: ${e.message}`);
   }
 }

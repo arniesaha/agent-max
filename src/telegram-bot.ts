@@ -5,8 +5,10 @@ import { writeMemoryEvent } from "./memory.js";
 import { createTask, updateTaskStatus, getRecentTasks } from "./task-journal.js";
 import { log } from "./logger.js";
 import { traceAgentTurn } from "./tracing.js";
-import { saveSession, clearSession } from "./session.js";
+import { saveSession, clearSession, restoreSession } from "./session.js";
 import { extractAssistantTextFromTurn, extractErrorFromTurn } from "./response.js";
+import { withSessionContext } from "./agentweave-context.js";
+import { previewInput, telegramSessionContext, type SessionContext } from "./session-context.js";
 
 // ── Deduplication — Issue #2 ─────────────────────────────────────────────────
 const processedUpdateIds = new Set<number>();
@@ -248,13 +250,15 @@ export function createTelegramBot(agent: Agent): Bot {
   bot.command("clear", async (ctx) => {
     if (!isAllowed(ctx)) return;
     conversationHistory.length = 0;
+    const session = telegramSessionContext(ctx.chat.id);
+    clearSession(session.sessionKey);
     agent.clearMessages();
-    clearSession();
     await ctx.reply("Conversation context cleared.");
   });
 
   // Core message handler — processes text with optional images
-  async function handleMessage(ctx: Context, text: string, images?: { type: "image"; data: string; mimeType: string }[]) {
+  async function handleMessage(ctx: Context, text: string, images?: { type: "image"; data: string; mimeType: string }[], session?: SessionContext) {
+    const sessionContext = session || telegramSessionContext(ctx.chat!.id, previewInput(text));
     // If agent is already running a request, abort it and wait for completion
     if (agent.state.isStreaming) {
       log("info", "Aborting previous agent run before starting new request");
@@ -270,6 +274,7 @@ export function createTelegramBot(agent: Agent): Bot {
       }
     }
 
+    restoreSession(agent, sessionContext.sessionKey);
     log("info", `Telegram message from ${ctx.from?.id}: ${text.slice(0, 100)}${images?.length ? ` (+${images.length} image${images.length > 1 ? "s" : ""})` : ""}`);
 
     conversationHistory.push({ role: "user", text, timestamp: Date.now() });
@@ -572,7 +577,7 @@ export function createTelegramBot(agent: Agent): Bot {
       trimHistory();
 
       updateTaskStatus(task.id, "completed", { response: responseText.slice(0, 500) });
-      saveSession(agent);
+      saveSession(agent, sessionContext.sessionKey);
       await writeMemoryEvent(`Telegram conversation with user ${ctx.from?.id}: "${text.slice(0, 80)}"`);
     } catch (e: any) {
       if (editTimer) clearInterval(editTimer);
@@ -601,12 +606,12 @@ export function createTelegramBot(agent: Agent): Bot {
       log("warn", `Duplicate update ${updateId} ignored`);
       return;
     }
-    const sessionId = `tg-${ctx.chat.id}`;
+    const session = telegramSessionContext(ctx.chat.id, previewInput(ctx.message.text));
     const telegramMessageId = ctx.message.message_id;
     const chatId = ctx.chat.id;
-    await traceAgentTurn("handleMessage", async () => {
-      await handleMessage(ctx, ctx.message.text);
-    }, { sessionId, telegramMessageId, chatId });
+    await withSessionContext(session, () => traceAgentTurn("handleMessage", async () => {
+      await handleMessage(ctx, ctx.message.text, undefined, session);
+    }, { sessionId: session.sessionId, telegramMessageId, chatId, latestInputPreview: session.latestInputPreview }));
   });
 
   // Photo messages (with optional caption)
@@ -619,7 +624,7 @@ export function createTelegramBot(agent: Agent): Bot {
     }
 
     const caption = ctx.message.caption || "What do you see in this image?";
-    const sessionId = `tg-${ctx.chat.id}`;
+    const session = telegramSessionContext(ctx.chat.id, previewInput(caption));
     const telegramMessageId = ctx.message.message_id;
     const chatId = ctx.chat.id;
 
@@ -640,9 +645,9 @@ export function createTelegramBot(agent: Agent): Bot {
       const ext = file.file_path?.split(".").pop()?.toLowerCase() || "jpg";
       const mimeType = ext === "png" ? "image/png" : ext === "gif" ? "image/gif" : ext === "webp" ? "image/webp" : "image/jpeg";
 
-      await traceAgentTurn("handleMessage", async () => {
-        await handleMessage(ctx, caption, [{ type: "image", data: base64, mimeType }]);
-      }, { sessionId, telegramMessageId, chatId });
+      await withSessionContext(session, () => traceAgentTurn("handleMessage", async () => {
+        await handleMessage(ctx, caption, [{ type: "image", data: base64, mimeType }], session);
+      }, { sessionId: session.sessionId, telegramMessageId, chatId, latestInputPreview: session.latestInputPreview }));
     } catch (e: any) {
       log("error", `Failed to process photo: ${e.message}`);
       await ctx.reply(`Failed to process image: ${e.message}`);

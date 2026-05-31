@@ -2,7 +2,7 @@ import { Type } from "@mariozechner/pi-ai";
 import type { AgentTool } from "@mariozechner/pi-agent-core";
 import { context, propagation } from "@opentelemetry/api";
 import { log } from "../logger.js";
-import { getAgentWeaveSession } from "../agentweave-context.js";
+import { getSessionContext } from "../agentweave-context.js";
 
 const NIX_A2A_URL = process.env.NIX_A2A_URL || "http://localhost:8771";
 const A2A_SHARED_SECRET = process.env.A2A_SHARED_SECRET || "";
@@ -22,6 +22,7 @@ export const delegateToNix: AgentTool = {
   execute: async (_id, params: any, signal) => {
     const { task, skill_id } = params;
     const taskId = crypto.randomUUID();
+    const activeSession = getSessionContext();
 
     try {
       // Submit task async — Nix returns immediately with status "submitted"
@@ -32,7 +33,8 @@ export const delegateToNix: AgentTool = {
           ...authHeaders,
           ...(() => { const h: Record<string, string> = {}; propagation.inject(context.active(), h); return h; })(),
           // AgentWeave session attribution for trace propagation
-          "X-AgentWeave-Parent-Session-Id": getAgentWeaveSession(),
+          "X-AgentWeave-Parent-Session-Id": activeSession.sessionId,
+          "X-AgentWeave-Parent-Session-Key": activeSession.sessionKey,
           "X-AgentWeave-Delegated-Session-Id": `nix-a2a-${taskId}`,
           "X-AgentWeave-Agent-Id": process.env.AGENTWEAVE_AGENT_ID || "max-v1",
           "X-AgentWeave-Task-Label": `a2a:${skill_id || "general"}:${task.slice(0, 50)}`,
