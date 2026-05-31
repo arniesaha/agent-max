@@ -4,7 +4,7 @@ import { spawn, ChildProcess } from "child_process";
 import { writeFileSync, readFileSync, existsSync, mkdirSync } from "fs";
 import { join } from "path";
 import { log } from "../logger.js";
-import { getAgentWeaveSession } from "../agentweave-context.js";
+import { getAgentWeaveSession, getAgentWeaveSessionKey } from "../agentweave-context.js";
 import { relayJobCompletionToTelegram } from "../telegram-notify.js";
 import { headAndTail } from "./truncate.js";
 
@@ -143,12 +143,14 @@ function startClaudeDelegation(prompt: string, taskLabel?: string, silent?: bool
 
   const jobId = crypto.randomUUID();
   const parentSessionId = getAgentWeaveSession();
+  const parentSessionKey = getAgentWeaveSessionKey();
   const childSessionId = `max-claude-subagent-${jobId}`;
   const label = taskLabel?.trim() || `claude_subagent:${prompt.slice(0, 60)}`;
 
   const attributionHeaders: Record<string, string> = {
     "X-AgentWeave-Session-Id": childSessionId,
     "X-AgentWeave-Parent-Session-Id": parentSessionId,
+    "X-AgentWeave-Parent-Session-Key": parentSessionKey,
     "X-AgentWeave-Agent-Id": process.env.AGENTWEAVE_AGENT_ID || "max-v1",
     "X-AgentWeave-Agent-Type": "subagent",
     "X-AgentWeave-Task-Label": label,
@@ -165,6 +167,7 @@ function startClaudeDelegation(prompt: string, taskLabel?: string, silent?: bool
     ANTHROPIC_CUSTOM_HEADERS: makeCustomHeaders(attributionHeaders),
     AGENTWEAVE_SESSION_ID: childSessionId,
     AGENTWEAVE_PARENT_SESSION_ID: parentSessionId,
+    AGENTWEAVE_PARENT_SESSION_KEY: parentSessionKey,
     AGENTWEAVE_AGENT_ID: process.env.AGENTWEAVE_AGENT_ID || "max-v1",
     AGENTWEAVE_AGENT_TYPE: "subagent",
     AGENTWEAVE_TASK_LABEL: label,

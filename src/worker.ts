@@ -2,7 +2,7 @@ import { parentPort, workerData } from "worker_threads";
 import { context, propagation } from "@opentelemetry/api";
 import type { AgentEvent } from "@mariozechner/pi-agent-core";
 import { createAgent } from "./agent.js";
-import { setAgentWeaveSession, resetAgentWeaveSession } from "./agentweave-context.js";
+import { makeA2ASessionContext, withSessionContext, type SessionContext } from "./agentweave-context.js";
 import { log } from "./logger.js";
 import { saveSession } from "./session.js";
 import { emitSessionArtifact, inferProjectsFromText } from "./session-emit.js";
@@ -25,9 +25,12 @@ interface WorkerTaskData {
   taskId: string;
   text: string;
   parentSessionId?: string;
+  parentSessionKey?: string;
   delegatedSessionId?: string;
+  delegatedSessionKey?: string;
   callerAgentId?: string;
   taskLabel?: string;
+  sessionContext?: SessionContext;
   /** Serialized W3C trace headers (e.g. traceparent) from the calling agent. */
   traceHeaders?: Record<string, string>;
   /** Per-task USD spend cap. When exceeded, the agent is aborted. */
@@ -50,7 +53,7 @@ async function postProgress(event: WorkerProgressEvent): Promise<void> {
 }
 
 async function main() {
-  const { taskId, text, parentSessionId, delegatedSessionId, callerAgentId, taskLabel, traceHeaders, maxBudgetUsd } = workerData as WorkerTaskData;
+  const { taskId, text, parentSessionId, parentSessionKey, delegatedSessionId, delegatedSessionKey, callerAgentId, taskLabel, traceHeaders, maxBudgetUsd } = workerData as WorkerTaskData;
 
   // Re-extract trace context from serialized headers so this worker's spans
   // are linked as children of the calling agent's trace.
@@ -65,8 +68,19 @@ async function main() {
   try {
     await postProgress({ type: "progress", taskId, message: "Worker started" });
 
-    if (parentSessionId) {
-      const sessionId = delegatedSessionId || `max-a2a-${taskId}`;
+    const sessionContext = (workerData as WorkerTaskData).sessionContext ?? makeA2ASessionContext({
+      taskId,
+      sync: false,
+      parentSessionId,
+      parentSessionKey,
+      delegatedSessionId,
+      delegatedSessionKey,
+      callerAgentId,
+      taskLabel,
+    });
+
+    await withSessionContext(sessionContext, async () => {
+    if (sessionContext.parentSessionId) {
       try {
         await fetch(`${AGENTWEAVE_MAX_PROXY}/session`, {
           method: "POST",
@@ -75,19 +89,20 @@ async function main() {
             ...(AGENTWEAVE_PROXY_TOKEN ? { Authorization: `Bearer ${AGENTWEAVE_PROXY_TOKEN}` } : {}),
           },
           body: JSON.stringify({
-            session_id: sessionId,
-            parent_session_id: parentSessionId,
-            task_label: taskLabel || `a2a from ${callerAgentId || "nix"}`,
+            session_id: sessionContext.sessionId,
+            session_key: sessionContext.sessionKey,
+            parent_session_id: sessionContext.parentSessionId,
+            parent_session_key: sessionContext.parentSessionKey,
+            task_label: sessionContext.taskLabel || taskLabel || `a2a from ${callerAgentId || "nix"}`,
             agent_type: "delegated",
           }),
         });
-        setAgentWeaveSession(sessionId);
       } catch (e: any) {
         log("warn", `Worker AgentWeave session set failed: ${e.message}`);
       }
     }
 
-    const agent = await createAgent();
+    const agent = await createAgent(sessionContext);
     let responseText = "";
     let budgetExceeded = false;
 
@@ -120,7 +135,7 @@ async function main() {
     unsub();
 
     if (budgetExceeded) {
-      saveSession(agent);
+      saveSession(agent, sessionContext);
       emitSessionArtifact({
         topic: taskLabel || text.slice(0, 80),
         projects: inferProjectsFromText(text),
@@ -151,7 +166,7 @@ async function main() {
     if (!responseText) {
       const lastMsg: any = agent.state.messages[agent.state.messages.length - 1];
       if (lastMsg?.role === "assistant" && lastMsg.stopReason === "error" && lastMsg.errorMessage) {
-        saveSession(agent);
+        saveSession(agent, sessionContext);
         emitSessionArtifact({
           topic: taskLabel || text.slice(0, 80),
           projects: inferProjectsFromText(text),
@@ -167,7 +182,7 @@ async function main() {
       }
     }
 
-    saveSession(agent);
+    saveSession(agent, sessionContext);
     emitSessionArtifact({
       topic: taskLabel || text.slice(0, 80),
       projects: inferProjectsFromText(text),
@@ -179,6 +194,7 @@ async function main() {
       message: "Worker completed",
       result: responseText,
       costUsd: cumulativeCostUsd,
+    });
     });
   } catch (e: any) {
     emitSessionArtifact({
@@ -193,23 +209,7 @@ async function main() {
       costUsd: cumulativeCostUsd,
     });
   } finally {
-    if (parentSessionId) {
-      resetAgentWeaveSession();
-      const AGENTWEAVE_PROXY_TOKEN = process.env.AGENTWEAVE_PROXY_TOKEN;
-      fetch(`${AGENTWEAVE_MAX_PROXY}/session`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...(AGENTWEAVE_PROXY_TOKEN ? { Authorization: `Bearer ${AGENTWEAVE_PROXY_TOKEN}` } : {}),
-        },
-        body: JSON.stringify({
-          session_id: "max-main",
-          parent_session_id: "",
-          task_label: "",
-          agent_type: "main",
-        }),
-      }).catch(() => {});
-    }
+    // Session attribution is scoped with AsyncLocalStorage; no process-global reset needed.
   }
   }); // end context.with
 }

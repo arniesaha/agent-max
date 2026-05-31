@@ -2,10 +2,13 @@ import { AgentWeaveConfig, traceTool, withSpan } from "agentweave";
 import {
   PROV_ACTIVITY_TYPE, ACTIVITY_AGENT_TURN,
   PROV_AGENT_ID, PROV_WAS_ASSOCIATED_WITH,
-  PROV_AGENT_TYPE, AGENT_TYPE_MAIN,
 } from "agentweave";
 import type { AgentTool } from "@mariozechner/pi-agent-core";
 import { log } from "./logger.js";
+import { getSessionContext } from "./agentweave-context.js";
+
+const PROV_AGENT_TYPE = "prov.agent.type";
+const AGENT_TYPE_MAIN = "main";
 
 /**
  * Initialize AgentWeave tracing. Call once at startup before agent creation.
@@ -55,15 +58,20 @@ export function traceTools(tools: AgentTool[]): AgentTool[] {
 export function traceAgentTurn<T>(
   name: string,
   fn: () => T | Promise<T>,
-  meta?: { sessionId?: string; telegramMessageId?: number; chatId?: number }
+  meta?: { sessionId?: string; sessionKey?: string; telegramMessageId?: number; chatId?: number }
 ): T | Promise<T> {
   if (!AgentWeaveConfig.enabled) return fn();
+  const activeSession = getSessionContext();
+  const sessionId = meta?.sessionId || activeSession.sessionId;
+  const sessionKey = meta?.sessionKey || activeSession.sessionKey;
   return withSpan(`agent.${name}`, {
     [PROV_ACTIVITY_TYPE]: ACTIVITY_AGENT_TURN,
     [PROV_AGENT_ID]: "max-v1",
     [PROV_WAS_ASSOCIATED_WITH]: "max-v1",
-    [PROV_AGENT_TYPE]: AGENT_TYPE_MAIN,
-    ...(meta?.sessionId ? { 'session.id': meta.sessionId, 'prov.session.id': meta.sessionId } : {}),
+    [PROV_AGENT_TYPE]: activeSession.agentType || AGENT_TYPE_MAIN,
+    'session.id': sessionId,
+    'prov.session.id': sessionId,
+    'prov.session.key': sessionKey,
     ...(meta?.telegramMessageId ? { 'telegram.message_id': String(meta.telegramMessageId) } : {}),
     ...(meta?.chatId ? { 'telegram.chat_id': String(meta.chatId) } : {}),
   }, () => fn());

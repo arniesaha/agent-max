@@ -5,8 +5,9 @@ import { writeMemoryEvent } from "./memory.js";
 import { createTask, updateTaskStatus, getRecentTasks } from "./task-journal.js";
 import { log } from "./logger.js";
 import { traceAgentTurn } from "./tracing.js";
-import { saveSession, clearSession } from "./session.js";
+import { restoreSession, saveSession, clearSession } from "./session.js";
 import { extractAssistantTextFromTurn, extractErrorFromTurn } from "./response.js";
+import { makeTelegramSessionContext, withSessionContext } from "./agentweave-context.js";
 
 // ── Deduplication — Issue #2 ─────────────────────────────────────────────────
 const processedUpdateIds = new Set<number>();
@@ -249,7 +250,7 @@ export function createTelegramBot(agent: Agent): Bot {
     if (!isAllowed(ctx)) return;
     conversationHistory.length = 0;
     agent.clearMessages();
-    clearSession();
+    clearSession(makeTelegramSessionContext(ctx.chat.id));
     await ctx.reply("Conversation context cleared.");
   });
 
@@ -487,8 +488,9 @@ export function createTelegramBot(agent: Agent): Bot {
         }
       });
 
-      const turnStartIndex = agent.state.messages.length;
+      restoreSession(agent);
       startEditing();
+      const restoredTurnStartIndex = agent.state.messages.length;
       await agent.prompt(text, images);
       unsub();
 
@@ -497,11 +499,11 @@ export function createTelegramBot(agent: Agent): Bot {
       if (pendingStatusEdit) clearTimeout(pendingStatusEdit);
 
       if (!responseText) {
-        responseText = extractAssistantTextFromTurn(agent.state.messages as any, turnStartIndex);
+        responseText = extractAssistantTextFromTurn(agent.state.messages as any, restoredTurnStartIndex);
       }
 
       if (!responseText) {
-        const llmError = extractErrorFromTurn(agent.state.messages as any, turnStartIndex);
+        const llmError = extractErrorFromTurn(agent.state.messages as any, restoredTurnStartIndex);
         if (llmError) {
           log("warn", `LLM error during prompt: ${llmError}`);
           updateTaskStatus(task.id, "failed", { error: llmError });
@@ -601,12 +603,12 @@ export function createTelegramBot(agent: Agent): Bot {
       log("warn", `Duplicate update ${updateId} ignored`);
       return;
     }
-    const sessionId = `tg-${ctx.chat.id}`;
+    const sessionContext = makeTelegramSessionContext(ctx.chat.id);
     const telegramMessageId = ctx.message.message_id;
     const chatId = ctx.chat.id;
     await traceAgentTurn("handleMessage", async () => {
-      await handleMessage(ctx, ctx.message.text);
-    }, { sessionId, telegramMessageId, chatId });
+      await withSessionContext(sessionContext, () => handleMessage(ctx, ctx.message.text));
+    }, { sessionId: sessionContext.sessionId, sessionKey: sessionContext.sessionKey, telegramMessageId, chatId });
   });
 
   // Photo messages (with optional caption)
@@ -619,7 +621,7 @@ export function createTelegramBot(agent: Agent): Bot {
     }
 
     const caption = ctx.message.caption || "What do you see in this image?";
-    const sessionId = `tg-${ctx.chat.id}`;
+    const sessionContext = makeTelegramSessionContext(ctx.chat.id);
     const telegramMessageId = ctx.message.message_id;
     const chatId = ctx.chat.id;
 
@@ -641,8 +643,8 @@ export function createTelegramBot(agent: Agent): Bot {
       const mimeType = ext === "png" ? "image/png" : ext === "gif" ? "image/gif" : ext === "webp" ? "image/webp" : "image/jpeg";
 
       await traceAgentTurn("handleMessage", async () => {
-        await handleMessage(ctx, caption, [{ type: "image", data: base64, mimeType }]);
-      }, { sessionId, telegramMessageId, chatId });
+        await withSessionContext(sessionContext, () => handleMessage(ctx, caption, [{ type: "image", data: base64, mimeType }]));
+      }, { sessionId: sessionContext.sessionId, sessionKey: sessionContext.sessionKey, telegramMessageId, chatId });
     } catch (e: any) {
       log("error", `Failed to process photo: ${e.message}`);
       await ctx.reply(`Failed to process image: ${e.message}`);

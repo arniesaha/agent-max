@@ -20,6 +20,7 @@ import { transformContext } from "./context.js";
 import { traceTools } from "./tracing.js";
 import { restoreSession } from "./session.js";
 import { checkPermission } from "./permissions.js";
+import { getSessionContext, type SessionContext } from "./agentweave-context.js";
 
 /**
  * Core tools — always registered. Small, general-purpose surface the model
@@ -113,7 +114,7 @@ function createDefaultModel(defaultModel: string) {
   return model;
 }
 
-export async function createAgent(): Promise<Agent> {
+export async function createAgent(sessionContext: SessionContext = getSessionContext()): Promise<Agent> {
   const defaultModel = process.env.DEFAULT_MODEL || "gemini-2.5-pro";
   const muxEnabled = process.env.MUX_ENABLED === "true";
   const model = muxEnabled ? createMuxModel(defaultModel) : createDefaultModel(defaultModel);
@@ -126,20 +127,26 @@ export async function createAgent(): Promise<Agent> {
   // Only send AgentWeave proxy token for non-Mux paths to avoid colliding with Mux auth.
   const proxyToken = process.env.AGENTWEAVE_PROXY_TOKEN;
   const muxApiKey = process.env.MUX_API_KEY;
-  const agentWeaveStreamFn: typeof streamSimple = (m, ctx, opts) =>
-    streamSimple(m, ctx, {
+  const agentWeaveStreamFn: typeof streamSimple = (m, ctx, opts) => {
+    const activeSession = getSessionContext();
+    return streamSimple(m, ctx, {
       ...opts,
       headers: {
         ...opts?.headers,
         "X-AgentWeave-Agent-Id": "max-v1",
-        "X-AgentWeave-Agent-Type": "main",
-        "X-AgentWeave-Session-Id": "max-main",
+        "X-AgentWeave-Agent-Type": activeSession.agentType,
+        "X-AgentWeave-Session-Id": activeSession.sessionId,
+        "X-AgentWeave-Session-Key": activeSession.sessionKey,
+        ...(activeSession.parentSessionId ? { "X-AgentWeave-Parent-Session-Id": activeSession.parentSessionId } : {}),
+        ...(activeSession.parentSessionKey ? { "X-AgentWeave-Parent-Session-Key": activeSession.parentSessionKey } : {}),
+        ...(activeSession.taskLabel ? { "X-AgentWeave-Task-Label": activeSession.taskLabel } : {}),
         "X-AgentWeave-Project": "max",
         "X-Runtime": "agent-max",
         ...(muxEnabled && muxApiKey ? { Authorization: `Bearer ${muxApiKey}` } : {}),
         ...(!muxEnabled && proxyToken ? { "X-AgentWeave-Proxy-Token": proxyToken } : {}),
       },
     });
+  };
 
   const agent = new Agent({
     initialState: {
@@ -180,7 +187,7 @@ export async function createAgent(): Promise<Agent> {
   agent.state.tools = allTools;
 
   // Restore previous session messages
-  restoreSession(agent);
+  restoreSession(agent, sessionContext);
 
   return agent;
 }

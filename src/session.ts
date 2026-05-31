@@ -2,11 +2,24 @@ import type { Agent } from "@mariozechner/pi-agent-core";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import { getState, setState } from "./task-journal.js";
 import { log } from "./logger.js";
+import { getSessionContext, MAIN_SESSION_CONTEXT, type SessionContext } from "./agentweave-context.js";
 
-const SESSION_KEY = "session_messages";
+const LEGACY_SESSION_KEY = "session_messages";
+const SESSION_KEY_PREFIX = "session_messages:";
 const MAX_TOOL_RESULT_CHARS = 2000; // truncate tool results to prevent session bloat
 const MAX_SESSION_MESSAGES = 20; // only save the most recent messages
-let saveTimer: ReturnType<typeof setTimeout> | null = null;
+const saveTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function contextOrActive(ctx?: SessionContext): SessionContext {
+  return ctx ?? getSessionContext();
+}
+
+export function storageKeyForSession(ctxOrKey?: SessionContext | string): string {
+  const sessionKey = typeof ctxOrKey === "string"
+    ? ctxOrKey
+    : contextOrActive(ctxOrKey).sessionKey;
+  return `${SESSION_KEY_PREFIX}${sessionKey}`;
+}
 
 /**
  * Truncate large tool results, strip thinking blocks, and limit message count
@@ -53,19 +66,26 @@ function trimForStorage(messages: AgentMessage[]): AgentMessage[] {
 /**
  * Save agent messages to SQLite (debounced 500ms).
  */
-export function saveSession(agent: Agent): void {
-  if (saveTimer) clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
+export function saveSession(agent: Agent, ctx?: SessionContext): void {
+  const sessionContext = contextOrActive(ctx);
+  const stateKey = storageKeyForSession(sessionContext);
+  const messages = [...agent.state.messages];
+  const existingTimer = saveTimers.get(stateKey);
+  if (existingTimer) clearTimeout(existingTimer);
+  const timer = setTimeout(() => {
     try {
-      const { messages: repaired } = repairErroredAssistantTurns(agent.state.messages);
+      const { messages: repaired } = repairErroredAssistantTurns(messages);
       const trimmed = trimForStorage(repaired);
       const json = JSON.stringify(trimmed);
-      setState(SESSION_KEY, json);
-      log("info", `Session saved (${trimmed.length} of ${agent.state.messages.length} messages)`);
+      setState(stateKey, json);
+      log("info", `Session saved for ${sessionContext.sessionKey} (${trimmed.length} of ${messages.length} messages)`);
     } catch (e: any) {
-      log("error", `Failed to save session: ${e.message}`);
+      log("error", `Failed to save session ${sessionContext.sessionKey}: ${e.message}`);
+    } finally {
+      saveTimers.delete(stateKey);
     }
   }, 500);
+  saveTimers.set(stateKey, timer);
 }
 
 /**
@@ -97,24 +117,35 @@ function repairErroredAssistantTurns(messages: AgentMessage[]): { messages: Agen
  * Restore agent messages from SQLite.
  * Returns the number of messages restored.
  */
-export function restoreSession(agent: Agent): number {
+export function restoreSession(agent: Agent, ctx?: SessionContext): number {
+  const sessionContext = contextOrActive(ctx);
+  const stateKey = storageKeyForSession(sessionContext);
   try {
-    const json = getState(SESSION_KEY);
-    if (!json) return 0;
+    let json = getState(stateKey);
+    if (!json && sessionContext.sessionKey === MAIN_SESSION_CONTEXT.sessionKey) {
+      json = getState(LEGACY_SESSION_KEY);
+    }
+    if (!json) {
+      agent.state.messages = [];
+      return 0;
+    }
 
     const parsed = JSON.parse(json);
-    if (!Array.isArray(parsed) || parsed.length === 0) return 0;
+    if (!Array.isArray(parsed) || parsed.length === 0) {
+      agent.state.messages = [];
+      return 0;
+    }
 
     const { messages, repaired } = repairErroredAssistantTurns(parsed);
     agent.state.messages = messages;
     if (repaired > 0) {
-      log("info", `Session restored (${messages.length} messages, repaired ${repaired} errored assistant turns)`);
+      log("info", `Session restored for ${sessionContext.sessionKey} (${messages.length} messages, repaired ${repaired} errored assistant turns)`);
     } else {
-      log("info", `Session restored (${messages.length} messages)`);
+      log("info", `Session restored for ${sessionContext.sessionKey} (${messages.length} messages)`);
     }
     return messages.length;
   } catch (e: any) {
-    log("error", `Failed to restore session: ${e.message}`);
+    log("error", `Failed to restore session ${sessionContext.sessionKey}: ${e.message}`);
     return 0;
   }
 }
@@ -122,11 +153,15 @@ export function restoreSession(agent: Agent): number {
 /**
  * Clear saved session from SQLite.
  */
-export function clearSession(): void {
+export function clearSession(ctx?: SessionContext): void {
+  const sessionContext = contextOrActive(ctx);
   try {
-    setState(SESSION_KEY, "[]");
-    log("info", "Session cleared");
+    setState(storageKeyForSession(sessionContext), "[]");
+    if (sessionContext.sessionKey === MAIN_SESSION_CONTEXT.sessionKey) {
+      setState(LEGACY_SESSION_KEY, "[]");
+    }
+    log("info", `Session cleared for ${sessionContext.sessionKey}`);
   } catch (e: any) {
-    log("error", `Failed to clear session: ${e.message}`);
+    log("error", `Failed to clear session ${sessionContext.sessionKey}: ${e.message}`);
   }
 }

@@ -33,12 +33,23 @@ jest.unstable_mockModule("../src/task-journal.js", () => ({
 jest.unstable_mockModule("../src/logger.js", () => ({ log: jest.fn() }));
 jest.unstable_mockModule("../src/session.js", () => ({
   saveSession: jest.fn(),
+  restoreSession: jest.fn(),
   loadSession: jest.fn().mockReturnValue(null),
 }));
 jest.unstable_mockModule("../src/agentweave-context.js", () => ({
   setAgentWeaveSession: jest.fn(),
   resetAgentWeaveSession: jest.fn(),
   getAgentWeaveSession: jest.fn().mockReturnValue("max-main"),
+  makeA2ASessionContext: jest.fn((args: any) => ({
+    sessionId: args.delegatedSessionId || `max-a2a-${args.taskId}`,
+    sessionKey: `a2a:${args.sync ? "sync" : "worker"}:test:${args.taskId}`,
+    agentType: args.sync ? "delegated" : "worker",
+    parentSessionId: args.parentSessionId,
+    parentSessionKey: args.parentSessionKey,
+    taskLabel: args.taskLabel,
+  })),
+  makeTuiSessionContext: jest.fn(() => ({ sessionId: "max-tui", sessionKey: "tui", agentType: "main" })),
+  withSessionContext: jest.fn((_ctx: any, fn: any) => fn()),
 }));
 jest.unstable_mockModule("../src/response.js", () => ({
   extractAssistantTextFromTurn: jest.fn().mockReturnValue(""),

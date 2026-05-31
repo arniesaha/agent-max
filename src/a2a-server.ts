@@ -13,9 +13,9 @@ import {
   advanceReportedSeq,
   setActualCost,
 } from "./task-journal.js";
-import { setAgentWeaveSession, resetAgentWeaveSession } from "./agentweave-context.js";
+import { makeA2ASessionContext, makeTuiSessionContext, withSessionContext, type SessionContext } from "./agentweave-context.js";
 import { log } from "./logger.js";
-import { saveSession } from "./session.js";
+import { restoreSession, saveSession } from "./session.js";
 import { extractAssistantTextFromTurn, extractErrorFromTurn } from "./response.js";
 import type { WorkerProgressEvent } from "./worker.js";
 import { relayTaskUpdateToTelegram, relayJobCompletionToTelegram } from "./telegram-notify.js";
@@ -64,6 +64,45 @@ const AGENT_CARD = {
     "ssh_to_nas",
   ],
 };
+
+async function registerAgentWeaveSession(ctx: SessionContext): Promise<void> {
+  if (!ctx.parentSessionId) return;
+  const AGENTWEAVE_PROXY_TOKEN = process.env.AGENTWEAVE_PROXY_TOKEN;
+  try {
+    await fetch(`${AGENTWEAVE_MAX_PROXY}/session`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(AGENTWEAVE_PROXY_TOKEN ? { Authorization: `Bearer ${AGENTWEAVE_PROXY_TOKEN}` } : {}),
+      },
+      body: JSON.stringify({
+        session_id: ctx.sessionId,
+        session_key: ctx.sessionKey,
+        parent_session_id: ctx.parentSessionId,
+        parent_session_key: ctx.parentSessionKey,
+        task_label: ctx.taskLabel || "a2a task",
+        agent_type: "delegated",
+      }),
+    });
+    log("info", `AgentWeave session set: ${ctx.sessionId} (parent: ${ctx.parentSessionId})`);
+  } catch (e: any) {
+    log("warn", `AgentWeave session set failed: ${e.message}`);
+  }
+}
+
+function messagesForTui(agent: Agent): { role: string; text: string }[] {
+  return agent.state.messages
+    .map((msg: any) => {
+      const text = Array.isArray(msg.content)
+        ? msg.content
+            .filter((c: any) => c.type === "text" && typeof c.text === "string")
+            .map((c: any) => c.text)
+            .join("")
+        : "";
+      return { role: msg.role, text };
+    })
+    .filter((msg) => (msg.role === "user" || msg.role === "assistant") && msg.text);
+}
 
 /**
  * Drain unreported activity entries to Telegram and advance the watermark.
@@ -114,14 +153,21 @@ export function createA2AServer(agent: Agent): express.Express {
     });
   });
 
+  app.get("/messages", authMiddleware, (_req, res) => {
+    const sessionContext = makeTuiSessionContext();
+    restoreSession(agent, sessionContext);
+    res.json({ sessionId: sessionContext.sessionId, sessionKey: sessionContext.sessionKey, messages: messagesForTui(agent) });
+  });
+
   app.post("/tasks", authMiddleware, async (req, res) => {
     let taskId: string | undefined;
 
     const parentSessionId = req.headers["x-agentweave-parent-session-id"] as string | undefined;
+    const parentSessionKey = req.headers["x-agentweave-parent-session-key"] as string | undefined;
     const delegatedSessionId = req.headers["x-agentweave-delegated-session-id"] as string | undefined;
+    const delegatedSessionKey = req.headers["x-agentweave-delegated-session-key"] as string | undefined;
     const callerAgentId = req.headers["x-agentweave-agent-id"] as string | undefined;
     const taskLabel = req.headers["x-agentweave-task-label"] as string | undefined;
-    const AGENTWEAVE_PROXY_TOKEN = process.env.AGENTWEAVE_PROXY_TOKEN;
 
     // Extract W3C traceparent from incoming request (for Nix → Max delegations).
     // Workers run in a separate thread — AsyncLocalStorage context doesn't cross
@@ -147,6 +193,16 @@ export function createA2AServer(agent: Agent): express.Express {
       const budgetCapUsd = isSync ? null : resolveBudgetCap(params.metadata);
       const task = createTask("a2a_task", "nix", { text, metadata: params.metadata }, { budgetCapUsd });
       taskId = task.id;
+      const sessionContext = makeA2ASessionContext({
+        taskId: task.id,
+        sync: isSync,
+        parentSessionId,
+        parentSessionKey,
+        delegatedSessionId,
+        delegatedSessionKey,
+        callerAgentId,
+        taskLabel,
+      });
       updateTaskStatus(task.id, "working");
 
       if (!isSync) {
@@ -161,9 +217,12 @@ export function createA2AServer(agent: Agent): express.Express {
               taskId: task.id,
               text,
               parentSessionId,
+              parentSessionKey,
               delegatedSessionId,
+              delegatedSessionKey,
               callerAgentId,
               taskLabel,
+              sessionContext,
               traceHeaders,
               maxBudgetUsd: budgetCapUsd,
             },
@@ -244,32 +303,12 @@ export function createA2AServer(agent: Agent): express.Express {
         return;
       }
 
-      if (parentSessionId) {
-        const sessionId = delegatedSessionId || `max-a2a-${task.id}`;
-        try {
-          await fetch(`${AGENTWEAVE_MAX_PROXY}/session`, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              ...(AGENTWEAVE_PROXY_TOKEN ? { Authorization: `Bearer ${AGENTWEAVE_PROXY_TOKEN}` } : {}),
-            },
-            body: JSON.stringify({
-              session_id: sessionId,
-              parent_session_id: parentSessionId,
-              task_label: taskLabel || `a2a from ${callerAgentId || "nix"}`,
-              agent_type: "delegated",
-            }),
-          });
-          log("info", `AgentWeave session set: ${sessionId} (parent: ${parentSessionId})`);
-          setAgentWeaveSession(sessionId);
-        } catch (e: any) {
-          log("warn", `AgentWeave session set failed: ${e.message}`);
-        }
-      }
+      await registerAgentWeaveSession(sessionContext);
 
       // Execute sync task within the incoming trace context as well
       const executeSyncTask = async () => {
         let responseText = "";
+        restoreSession(agent, sessionContext);
         const turnStartIndex = agent.state.messages.length;
         const unsub = agent.subscribe((event: AgentEvent) => {
           if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
@@ -288,7 +327,7 @@ export function createA2AServer(agent: Agent): express.Express {
           ? extractErrorFromTurn(agent.state.messages as any, turnStartIndex)
           : null;
 
-        saveSession(agent);
+        saveSession(agent, sessionContext);
 
         if (llmError) {
           log("warn", `LLM error during A2A sync task ${task.id}: ${llmError}`);
@@ -316,7 +355,7 @@ export function createA2AServer(agent: Agent): express.Express {
         }
       };
 
-      await context.with(incomingContext, executeSyncTask);
+      await context.with(incomingContext, () => withSessionContext(sessionContext, executeSyncTask));
     } catch (e: any) {
       agent.abort();
       log("error", `A2A task error: ${e.message}`);
@@ -327,22 +366,7 @@ export function createA2AServer(agent: Agent): express.Express {
         error: { code: -32000, message: e.message },
       });
     } finally {
-      if (parentSessionId && String(req.query.sync || "false").toLowerCase() === "true") {
-        resetAgentWeaveSession();
-        fetch(`${AGENTWEAVE_MAX_PROXY}/session`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            ...(AGENTWEAVE_PROXY_TOKEN ? { Authorization: `Bearer ${AGENTWEAVE_PROXY_TOKEN}` } : {}),
-          },
-          body: JSON.stringify({
-            session_id: "max-main",
-            parent_session_id: "",
-            task_label: "",
-            agent_type: "main",
-          }),
-        }).catch(() => {});
-      }
+      // Session attribution is scoped with AsyncLocalStorage; no process-global reset needed.
     }
   });
 
@@ -361,6 +385,7 @@ export function createA2AServer(agent: Agent): express.Express {
 
       const text = params.message.parts[0].text;
       log("info", `A2A stream task: ${text.slice(0, 100)}`);
+      const sessionContext = makeTuiSessionContext();
 
       const task = createTask("a2a_stream", "tui", { text });
       updateTaskStatus(task.id, "working");
@@ -378,6 +403,8 @@ export function createA2AServer(agent: Agent): express.Express {
 
       sendEvent("task_start", { taskId: task.id });
 
+      await withSessionContext(sessionContext, async () => {
+      restoreSession(agent, sessionContext);
       const unsub = agent.subscribe((event: AgentEvent) => {
         switch (event.type) {
           case "message_update":
@@ -396,7 +423,8 @@ export function createA2AServer(agent: Agent): express.Express {
 
       await agent.prompt(text);
       unsub();
-      saveSession(agent);
+      saveSession(agent, sessionContext);
+      });
 
       updateTaskStatus(task.id, "completed", { response: "(streamed)" });
       sendEvent("task_end", { taskId: task.id, status: "completed" });
