@@ -116,6 +116,21 @@ function createDefaultModel(defaultModel: string) {
 }
 
 
+// HTTP header values must be Latin-1 (a ByteString, char codes 0-255). User
+// input from mobile keyboards routinely contains smart quotes, em-dashes, and
+// emoji (code points > 255), which make fetch throw "Cannot convert argument to
+// a ByteString …" before the request is even sent. Transliterate the common
+// punctuation and strip anything else down to printable ASCII so diagnostic
+// headers carrying user text can never break the LLM call.
+export function toHeaderValue(value: string): string {
+  return value
+    .replace(/[‘’‚‛]/g, "'")
+    .replace(/[“”„‟]/g, '"')
+    .replace(/[–—]/g, "-")
+    .replace(/…/g, "...")
+    .replace(/[^\x20-\x7E]/g, "");
+}
+
 export function agentWeaveHeadersForSession(
   activeSession: SessionContext,
   opts: { muxEnabled: boolean; muxApiKey?: string; proxyToken?: string }
@@ -123,7 +138,7 @@ export function agentWeaveHeadersForSession(
   const agentType = activeSession.surface === "a2a" || activeSession.surface === "worker" || activeSession.surface === "subagent"
     ? "delegated"
     : "main";
-  return {
+  const headers: Record<string, string> = {
     "X-AgentWeave-Agent-Id": "max-v1",
     "X-AgentWeave-Agent-Type": agentType,
     "X-AgentWeave-Session-Id": activeSession.sessionId,
@@ -132,9 +147,15 @@ export function agentWeaveHeadersForSession(
     ...(activeSession.taskLabel ? { "X-AgentWeave-Task-Label": activeSession.taskLabel } : {}),
     ...(activeSession.latestInputPreview ? { "X-AgentWeave-Input-Preview": activeSession.latestInputPreview } : {}),
     "X-Runtime": "agent-max",
-    ...(opts.muxEnabled && opts.muxApiKey ? { Authorization: `Bearer ${opts.muxApiKey}` } : {}),
-    ...(!opts.muxEnabled && opts.proxyToken ? { "X-AgentWeave-Proxy-Token": opts.proxyToken } : {}),
   };
+  // Sanitize only the AgentWeave diagnostic headers (which may carry user text).
+  // Auth tokens are added afterward untouched.
+  for (const key of Object.keys(headers)) {
+    headers[key] = toHeaderValue(headers[key]);
+  }
+  if (opts.muxEnabled && opts.muxApiKey) headers.Authorization = `Bearer ${opts.muxApiKey}`;
+  if (!opts.muxEnabled && opts.proxyToken) headers["X-AgentWeave-Proxy-Token"] = opts.proxyToken;
+  return headers;
 }
 
 export async function createAgent(sessionContext: SessionContext = MAIN_SESSION_CONTEXT): Promise<Agent> {

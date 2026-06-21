@@ -1,5 +1,5 @@
 import { describe, it, expect } from "@jest/globals";
-import { agentWeaveHeadersForSession } from "../src/agent.js";
+import { agentWeaveHeadersForSession, toHeaderValue } from "../src/agent.js";
 
 describe("AgentWeave session headers", () => {
   it("attributes main/TUI traffic to max-main", () => {
@@ -42,5 +42,31 @@ describe("AgentWeave session headers", () => {
     expect(headers["X-AgentWeave-Parent-Session-Id"]).toBe("nix-session-abc");
     expect(headers["X-AgentWeave-Agent-Type"]).toBe("delegated");
     expect(headers["X-AgentWeave-Task-Label"]).toBe("sync-from-nix");
+  });
+
+  it("sanitizes non-Latin-1 user input so headers never throw a ByteString error", () => {
+    // U+2019 smart apostrophe (8217) at index 3 of "Let's …" was the original crash.
+    const headers = agentWeaveHeadersForSession(
+      {
+        sessionKey: "telegram:direct:42",
+        sessionId: "telegram:direct:42",
+        surface: "telegram",
+        latestInputPreview: "Let’s debug the ssh skill — try \u{1F600}",
+      },
+      { muxEnabled: false }
+    );
+
+    const preview = headers["X-AgentWeave-Input-Preview"];
+    expect(preview).toBe("Let's debug the ssh skill - try ");
+    // Must be encodable as a real HTTP header (Latin-1 / ByteString).
+    expect(() => new Headers(headers)).not.toThrow();
+    for (const value of Object.values(headers)) {
+      expect(/[^\x20-\x7E]/.test(value)).toBe(false);
+    }
+  });
+
+  it("toHeaderValue transliterates smart punctuation and drops other non-ASCII", () => {
+    expect(toHeaderValue("‘a’ “b” – — …")).toBe("'a' \"b\" - - ...");
+    expect(toHeaderValue("plain ascii")).toBe("plain ascii");
   });
 });
