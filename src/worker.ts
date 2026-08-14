@@ -5,7 +5,6 @@ import { createAgent } from "./agent.js";
 import { withSessionContext } from "./agentweave-context.js";
 import { log } from "./logger.js";
 import { saveSession } from "./session.js";
-import { emitSessionArtifact, inferProjectsFromText } from "./session-emit.js";
 import { MAIN_SESSION_CONTEXT, a2aSessionContext, previewInput } from "./session-context.js";
 
 const AGENTWEAVE_MAX_PROXY = process.env.AGENTWEAVE_PROXY_URL || "http://arnabsnas.local:30400";
@@ -129,11 +128,6 @@ async function main() {
 
     if (budgetExceeded) {
       saveSession(agent, sessionContext.sessionKey);
-      emitSessionArtifact({
-        topic: taskLabel || text.slice(0, 80),
-        projects: inferProjectsFromText(text),
-        type: "maintenance",
-      });
       await postProgress({
         type: "error",
         taskId,
@@ -160,11 +154,6 @@ async function main() {
       const lastMsg: any = agent.state.messages[agent.state.messages.length - 1];
       if (lastMsg?.role === "assistant" && lastMsg.stopReason === "error" && lastMsg.errorMessage) {
         saveSession(agent, sessionContext.sessionKey);
-        emitSessionArtifact({
-          topic: taskLabel || text.slice(0, 80),
-          projects: inferProjectsFromText(text),
-          type: "maintenance",
-        });
         await postProgress({
           type: "error",
           taskId,
@@ -176,11 +165,6 @@ async function main() {
     }
 
     saveSession(agent, sessionContext.sessionKey);
-    emitSessionArtifact({
-      topic: taskLabel || text.slice(0, 80),
-      projects: inferProjectsFromText(text),
-      type: "coding",
-    });
     await postProgress({
       type: "complete",
       taskId,
@@ -189,11 +173,6 @@ async function main() {
       costUsd: cumulativeCostUsd,
     });
   } catch (e: any) {
-    emitSessionArtifact({
-      topic: taskLabel || text.slice(0, 80),
-      projects: inferProjectsFromText(text),
-      type: "maintenance",
-    });
     await postProgress({
       type: "error",
       taskId,
