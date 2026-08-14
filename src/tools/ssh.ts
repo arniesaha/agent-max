@@ -2,10 +2,13 @@ import { Type } from "@mariozechner/pi-ai";
 import type { AgentTool } from "@mariozechner/pi-agent-core";
 import { execFile } from "child_process";
 import { promisify } from "util";
+import { homedir } from "os";
+import { join } from "path";
 
 const execFileAsync = promisify(execFile);
 const NAS_HOST = process.env.NAS_HOST || "localhost";
 const NAS_USER = process.env.NAS_USER || "";
+const IDENTITY_FILE = join(homedir(), ".ssh", "id_ed25519");
 
 export const sshToNas: AgentTool = {
   name: "ssh_to_nas",
@@ -20,6 +23,8 @@ export const sshToNas: AgentTool = {
       const { stdout, stderr } = await execFileAsync("/usr/bin/ssh", [
         "-o", "ConnectTimeout=10",
         "-o", "StrictHostKeyChecking=no",
+        "-i", IDENTITY_FILE,
+        "-o", "IdentitiesOnly=yes",
         `${NAS_USER}@${NAS_HOST}`,
         command,
       ], { timeout: 60000 });
